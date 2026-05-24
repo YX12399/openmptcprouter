@@ -14,24 +14,50 @@
 
 #define RATAN_PROTO_VERSION  1
 
-/* UDP probe packet (request) and echo (response). 24 bytes. */
+/*
+ * Tagged-union envelope used on /run/ratan/telemetry.sock.
+ *
+ * Wire layout per datagram:
+ *     [struct ratan_event_hdr][payload of hdr.len bytes]
+ *
+ * Prober writes RATAN_EVENT_SAMPLE; predictor writes _STATE / _WEIGHT;
+ * Step 4b additions write _DISCOVERY / _FLOW / _MOS / _INJECT.
+ *
+ * telemetryd is the sole reader. It dispatches by kind, persists to
+ * SQLite, broadcasts to SSE subscribers, exposes Prometheus counters.
+ */
+struct ratan_event_hdr {
+	uint8_t  kind;       /* RATAN_EVENT_* */
+	uint8_t  version;    /* RATAN_PROTO_VERSION */
+	uint16_t len;        /* payload length */
+} __attribute__((packed));
+
+#define RATAN_EVENT_SAMPLE     1
+#define RATAN_EVENT_STATE      2   /* classifier FSM transition */
+#define RATAN_EVENT_WEIGHT     3   /* weight change */
+#define RATAN_EVENT_DISCOVERY  4   /* Step 4b: WAN/LAN/MPTCP discovery */
+#define RATAN_EVENT_FLOW       5   /* Step 4b: per-flow event */
+#define RATAN_EVENT_MOS        6   /* Step 4b: per-flow MOS sample */
+#define RATAN_EVENT_INJECT     7   /* Step 4b: test inject marker */
+
+/* UDP probe packet (request) and echo (response). 24 bytes.
+ * Same on wire to the VPS responder; not part of the telemetry envelope. */
 struct ratan_probe {
 	uint8_t  version;      /* RATAN_PROTO_VERSION */
 	uint8_t  flags;        /* bit 0: 1 = response, 0 = request */
 	uint16_t wan_id;       /* sender's WAN index (0..MPTCP_SUBFLOWS_MAX-1) */
 	uint32_t seq;          /* per-WAN monotonic sequence */
-	uint64_t tx_ns;        /* sender's CLOCK_MONOTONIC at TX (req) -- echoed verbatim */
+	uint64_t tx_ns;        /* sender's CLOCK_MONOTONIC at TX (req) -- echoed */
 	uint64_t rx_ns;        /* responder's CLOCK_MONOTONIC at RX (resp); 0 in req */
 } __attribute__((packed));
 
 #define RATAN_PROBE_FLAG_RESPONSE  0x01
 
-/* Sample emitted over /run/ratan/samples.sock to the predictor.
- * One per probe round-trip (or one loss event). 32 bytes. */
+/* Sample payload (RATAN_EVENT_SAMPLE). 28 bytes. */
 struct ratan_sample {
 	uint64_t ts_ns;        /* CLOCK_MONOTONIC when sample generated */
 	uint8_t  wan_id;
-	uint8_t  event;        /* RATAN_EVENT_* */
+	uint8_t  event;        /* RATAN_SAMPLE_* */
 	uint16_t _pad;
 	uint32_t seq;
 	uint32_t rtt_us;       /* 0 on loss */
@@ -39,9 +65,28 @@ struct ratan_sample {
 	uint32_t jitter_us;    /* EWMA |rtt_i - rtt_baseline| */
 } __attribute__((packed));
 
-#define RATAN_EVENT_OK              0
-#define RATAN_EVENT_LOSS            1
-#define RATAN_EVENT_FAST_FAILOVER   2  /* prober just wrote weight=0 to BPF map */
-#define RATAN_EVENT_RECOVERY        3  /* first OK after loss streak */
+#define RATAN_SAMPLE_OK              0
+#define RATAN_SAMPLE_LOSS            1
+#define RATAN_SAMPLE_FAST_FAILOVER   2  /* prober just wrote weight=0 to BPF map */
+#define RATAN_SAMPLE_RECOVERY        3  /* first OK after loss streak */
+
+/* State-transition payload (RATAN_EVENT_STATE). Up to 80 bytes. */
+struct ratan_state_event {
+	uint64_t ts_ns;
+	uint8_t  wan_id;
+	uint8_t  _pad[3];
+	char     from_state[16];   /* e.g. "HEALTHY" */
+	char     to_state[16];
+	char     reason[32];       /* short tag for the transition */
+} __attribute__((packed));
+
+/* Weight-change payload (RATAN_EVENT_WEIGHT). 24 bytes. */
+struct ratan_weight_event {
+	uint64_t ts_ns;
+	uint8_t  wan_id;
+	uint8_t  _pad[3];
+	uint32_t weight;       /* 0..100 */
+	char     source[8];    /* "predict", "prober", "manual" */
+} __attribute__((packed));
 
 #endif /* RATAN_PROTO_H */

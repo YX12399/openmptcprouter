@@ -9,6 +9,7 @@
 ratan_loader
 ratan_prober
 ratan_probe_responder
+ratan_telemetryd
 ratan_classifier.ko
 
 # generated headers

@@ -55,7 +55,7 @@
 #define DEFAULT_INTERVAL_MS   50
 #define DEFAULT_TIMEOUT_MS    200
 #define DEFAULT_FAILOVER_N    3
-#define DEFAULT_SAMPLES_SOCK  "/run/ratan/samples.sock"
+#define DEFAULT_SAMPLES_SOCK  "/run/ratan/telemetry.sock"
 #define DEFAULT_WEIGHTS_MAP   "/sys/fs/bpf/ratan/path_weights"
 #define DEFAULT_BASE_WEIGHT   50      /* what each WAN starts at (predictor overrides) */
 #define JITTER_ALPHA_NUM      1       /* jitter EWMA = (1 * sample + 7 * prev) / 8 */
@@ -181,11 +181,25 @@ static int open_samples_sock(const char *path)
 
 static void emit_sample(int fd, const char *path, const struct ratan_sample *s)
 {
+	/* Tagged-union envelope: telemetryd dispatches by kind. The header +
+	 * payload fit in a single datagram, so this is one sendto syscall. */
+	struct {
+		struct ratan_event_hdr hdr;
+		struct ratan_sample    payload;
+	} __attribute__((packed)) frame = {
+		.hdr = {
+			.kind    = RATAN_EVENT_SAMPLE,
+			.version = RATAN_PROTO_VERSION,
+			.len     = sizeof(struct ratan_sample),
+		},
+		.payload = *s,
+	};
+
 	struct sockaddr_un sa = { .sun_family = AF_UNIX };
 	strncpy(sa.sun_path, path, sizeof(sa.sun_path) - 1);
-	(void)sendto(fd, s, sizeof(*s), MSG_DONTWAIT,
+	(void)sendto(fd, &frame, sizeof(frame), MSG_DONTWAIT,
 		     (struct sockaddr *)&sa, sizeof(sa));
-	/* drop on the floor if predictor isn't reading; we don't block probing */
+	/* drop on the floor if telemetryd isn't reading; we don't block probing */
 }
 
 static int open_wan_socket(const char *iface, struct sockaddr_in *sa)
@@ -288,7 +302,7 @@ static void *wan_thread(void *arg)
 
 		{
 			uint8_t event = (w->loss_streak > 0)
-					? RATAN_EVENT_RECOVERY : RATAN_EVENT_OK;
+					? RATAN_SAMPLE_RECOVERY : RATAN_SAMPLE_OK;
 			w->loss_streak = 0;
 			/* Prober never WRITES on recovery -- the predictor (Step 6)
 			 * owns weight restoration so policy stays in one place. */
@@ -309,7 +323,7 @@ static void *wan_thread(void *arg)
 loss:
 		{
 			w->loss_streak++;
-			uint8_t event = RATAN_EVENT_LOSS;
+			uint8_t event = RATAN_SAMPLE_LOSS;
 
 			if (w->loss_streak >= cfg->failover_n && !w->in_failover) {
 				if (would_strand_user(w->idx, 0)) {
@@ -319,7 +333,7 @@ loss:
 						w->iface, w->loss_streak);
 				} else if (write_weight(w->subflow_idx, 0) == 0) {
 					w->in_failover = true;
-					event = RATAN_EVENT_FAST_FAILOVER;
+					event = RATAN_SAMPLE_FAST_FAILOVER;
 					log_msg(LOG_WARNING,
 						"[%s] fast failover: weight=0 after %u losses",
 						w->iface, w->loss_streak);
@@ -367,7 +381,7 @@ static void usage(const char *me)
 "  --interval-ms N        probe cadence (default %u)\n"
 "  --timeout-ms N         per-probe response timeout (default %u)\n"
 "  --failover-n N         consecutive losses -> weight=0 (default %u)\n"
-"  --samples-sock PATH    /run/ratan/samples.sock by default\n"
+"  --samples-sock PATH    /run/ratan/telemetry.sock by default\n"
 "  --weights-map PATH     %s by default\n"
 "  --base-weight N        initial weight per WAN (default %u)\n"
 "  --wan IFACE:IDX        repeatable; IDX = MPTCP subflow index 0..%u\n"

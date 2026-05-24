@@ -24,7 +24,7 @@ ratan/
 └── scripts/                        build wrappers                                  [STEP 10]
 ```
 
-## Current state — Steps 1–3 of 17
+## Current state — Steps 1–4a of 17
 
 Shipped (Step 1, scheduler source):
 - `src/sched/ratan_sched.bpf.c` — BPF struct_ops MPTCP scheduler. Default behavior = highest weight in a pinned `ratan_path_weights` map wins; falls back to first-active subflow if weights are all zero.
@@ -47,7 +47,26 @@ Shipped (Step 3, fast UDP prober — the sub-200ms KPI workstream):
 - `packaging/openwrt/ratan-prober/` — OpenWrt package + procd init (waits for `ratan-sched`'s BPF map to exist before starting) + UCI config (`/etc/config/ratan-prober`).
 - `ratan-full` metapackage now depends on `+ratan-prober`.
 
-Not yet shipped: telemetry, classifier, predictor, QoS, handover learner, CLI, LuCI UI, relay client, debian packaging, VPS Ansible.
+Shipped (Step 4a, telemetry core — the data plane behind every UI/dashboard later):
+- `src/prober/ratan_proto.h` — extended with a tagged-union event envelope (`ratan_event_hdr`) and payload structs for state-transitions + weight-changes. The prober was updated to wrap its samples in the envelope (one extra 4-byte header per datagram).
+- `src/telemetry/schema.sql` — SQLite schema covering samples, state transitions, weights, sessions, plus tables reserved for discovery/flows/MOS/injects (Step 4b).
+- `src/telemetry/ratan_telemetryd.c` — sole reader of `/run/ratan/telemetry.sock`. SQLite WAL writer. Single-threaded poll loop. Exposes HTTP on `127.0.0.1:9180`:
+  - `GET  /healthz` — liveness
+  - `GET  /metrics` — Prometheus exposition (samples, losses, failovers, transitions, weight changes, HTTP/SSE counters, active session id)
+  - `GET  /stream` — Server-Sent Events live feed of every event (`{"kind":"sample",...}`)
+  - `GET  /sessions` — JSON list of past recordings
+  - `POST /sessions {name, metadata?}` — start a session; subsequent events get linked to it
+  - `POST /sessions/<id>/stop` — stop and compute a summary (per-WAN samples / loss / failover counts / RTT avg + max, transition + weight change totals)
+  - `GET  /sessions/<id>` — JSON details + summary
+  - `GET  /sessions/<id>/download` — full timeline as a single JSON file (`Content-Disposition: attachment` — the UI's Download button)
+  - `DELETE /sessions/<id>` — remove a session and its linked rows
+  - CORS-enabled for browser access from the Vercel dashboard.
+- `packaging/openwrt/ratan-telemetry/` — OpenWrt package + procd init (`START=65`, before prober's `80`) + UCI config (`/etc/config/ratan-telemetry`).
+- `ratan-full` metapackage now also depends on `+ratan-telemetry`.
+
+**End-to-end verified locally** (Ubuntu 24.04): the daemon ingests prober-shaped frames, persists them, the session summary is correct, the download endpoint returns the full timeline, and the SSE stream broadcasts events to subscribers within milliseconds.
+
+Not yet shipped (Step 4b): discovery reader (netlink/inotify/UBUS subscribers), per-flow tracker (CTNETLINK + nDPI), MOS computer, `ratan-test` harness with YAML recipes. Then: classifier (Step 5), predictor (Step 6), QoS (Step 8), handover learner (Step 9), CLI (Step 10), LuCI UI (Step 11), relay (Step 12), Vercel dashboard (Step 13).
 
 ## Building an actual OMR firmware image (Step 2)
 
@@ -86,6 +105,30 @@ Two important `build.sh` interactions:
 - `OMR_DIST=ratan` makes `build.sh` `src-link` our feed as `ratan` and auto-emit `CONFIG_PACKAGE_ratan-full=y` (which depends on `openmptcprouter-full + ratan-sched`).
 
 First build will take hours (downloads OpenWrt sources, builds toolchain, kernel, all packages). Output lands in `source/bin/targets/<target>/<subtarget>/`.
+
+## Quick telemetry daemon test (Ubuntu 24.04, no kernel changes)
+
+```sh
+sudo apt install -y build-essential libsqlite3-dev
+cd ratan/src/telemetry && make
+
+mkdir -p /tmp/ratan_smoke
+./ratan_telemetryd \
+    --db /tmp/ratan_smoke/test.db \
+    --schema ./schema.sql \
+    --sock /tmp/ratan_smoke/telemetry.sock \
+    --http-host 127.0.0.1 --http-port 19180 \
+    --foreground &
+
+# In another terminal:
+curl http://127.0.0.1:19180/healthz                      # ok
+curl -X POST http://127.0.0.1:19180/sessions \
+     -d '{"name":"smoke"}'                               # {"id":1,...}
+curl http://127.0.0.1:19180/metrics                      # Prometheus format
+curl -N http://127.0.0.1:19180/stream                    # live SSE
+curl -X POST http://127.0.0.1:19180/sessions/1/stop      # summary
+curl -O -J http://127.0.0.1:19180/sessions/1/download    # downloads ratan-session-1.json
+```
 
 ## Quick prober loopback test (any Linux box, no kernel changes)
 

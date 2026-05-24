@@ -25,9 +25,9 @@ define Package/ratan-full
   DEPENDS:= \
     +openmptcprouter-full \
     +ratan-sched \
-    +ratan-prober
+    +ratan-prober \
+    +ratan-telemetry
   # Future components will be added here as they ship:
-  #   +ratan-telemetry   (Step 4)
   #   +ratan-classifier  (Step 5)
   #   +ratan-predictor   (Step 6)
   #   +ratan-qos         (Step 8)
