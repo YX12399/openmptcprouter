@@ -68,6 +68,7 @@ define Build/Prepare
 	$(CP) $(RATAN_CLS_SRC)/__init__.py        $(PKG_BUILD_DIR)/classifier/
 	$(CP) $(RATAN_CLS_SRC)/fsm.py             $(PKG_BUILD_DIR)/classifier/
 	$(CP) $(RATAN_CLS_SRC)/ewma.py            $(PKG_BUILD_DIR)/classifier/
+	$(CP) $(RATAN_CLS_SRC)/handover.py        $(PKG_BUILD_DIR)/classifier/
 endef
 
 define Build/Configure
@@ -86,6 +87,8 @@ define Package/ratan-classifier/install
 		$(1)/usr/lib/ratan-classifier/classifier/fsm.py
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/classifier/ewma.py \
 		$(1)/usr/lib/ratan-classifier/classifier/ewma.py
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/classifier/handover.py \
+		$(1)/usr/lib/ratan-classifier/classifier/handover.py
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/ratan-classifier.init $(1)/etc/init.d/ratan-classifier
 	$(INSTALL_DIR) $(1)/etc/ratan

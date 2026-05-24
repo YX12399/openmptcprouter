@@ -24,7 +24,7 @@ ratan/
 └── scripts/                        build wrappers                                  [STEP 10]
 ```
 
-## Current state — Steps 1–5 of 17 (Step 5 = the smart classifier)
+## Current state — Steps 1–5 + 9 of 17
 
 Shipped (Step 1, scheduler source):
 - `src/sched/ratan_sched.bpf.c` — BPF struct_ops MPTCP scheduler. Default behavior = highest weight in a pinned `ratan_path_weights` map wins; falls back to first-active subflow if weights are all zero.
@@ -110,7 +110,15 @@ Shipped (Step 5, the smart classifier — the **heart of "smart"**):
 
 **Verified end-to-end locally**: telemetry daemon + classifier started; fed 1.25s of baseline OK samples on two WANs (25ms / 60ms), then 5 consecutive losses on WAN 0 (the Starlink-handover signature); classifier transitioned `HEALTHY → TRANSIENT (consec_loss_100ms)` then `TRANSIENT → HEALTHY (blip_ended_200ms)` 350ms later; **weight stayed at 70 the whole time**; transitions correctly persisted in the SQLite `state_transitions` table.
 
-**Step 5 hardware-test notes (carry forward):**
+Shipped (Step 9, handover predictor — variable 15-60s cadence):
+- `src/classifier/handover.py` — `HandoverPredictor` class implementing the FSM's `preempter` interface. Per-WAN sliding-window inter-event tracking (last 20 handovers), median-based prediction gated by coefficient of variation (tight/loose/chaotic confidence tiers), automatic miss-streak unlock after 3 consecutive failed predictions, configurable pre-emption window `[predicted - 30ms, predicted + 500ms]`. Pure Python with injected clock for deterministic tests.
+- `src/classifier/tests/test_handover.py` — **10 new unit tests, all passing**. Covers cold start, tight lock at consistent 15s, loose/chaotic detection, pre-emption window timing, miss-streak unlock, signature-envelope exclusion (microblips and long-degradation streaks correctly excluded), per-WAN isolation.
+- `src/classifier/ratan-classifier` — orchestrator wires the predictor as `preempter` on every `WanFsm`, feeds samples to it BEFORE the FSM (so `is_about_to_handover()` reflects the current sample). Writes `/run/ratan/handover-status.json` (1s throttle + force-write on every state transition) so UI/curl/Grafana can see what the predictor thinks live.
+- Default `classifier.json` now includes the `handover` block.
+
+**Verified end-to-end locally**: 8 handover blips at consistent 15.3s spacing produced `events_total=7 intervals_tracked=6 confidence=tight cov=0.0 median_interval_s=15.3`. Classifier emitted 8 correct `HEALTHY → TRANSIENT → HEALTHY` cycles. The status file updated to reflect the lock.
+
+**Step 5 + 9 hardware-test notes (carry forward):**
 - `down_sustain_ms=1000` is a safe upper bound given Starlink handovers max ~300ms. Field data may show distinct bimodal distribution; if so, can be lowered to e.g. 500ms for faster DOWN entry. Tune only with telemetry from the real dish.
 - Starlink LEO satellite handovers happen every **15-60 seconds** (variable per session, not fixed 15s). The FSM is cadence-agnostic; the prediction layer (Step 9) tracks inter-handover intervals over a sliding window and pre-empts only when the coefficient of variation indicates consistent cadence.
 - Compound case (minor obstruction + handover) verified by unit test `test_minor_obstruction_plus_handovers_stays_usable` and by the new `starlink_obstruction_plus_handover.yaml` recipe. FSM correctly stays HEALTHY at 2% baseline (the call-routing decision belongs to QoS layer Step 8, not the classifier).

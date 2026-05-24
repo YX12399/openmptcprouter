@@ -26,5 +26,9 @@
   "bpf": {
     "map_path": "/sys/fs/bpf/ratan/path_weights",
     "use_bpftool": true
+  },
+  "handover": {
+    "enabled": true,
+    "status_file": "/run/ratan/handover-status.json"
   }
 }

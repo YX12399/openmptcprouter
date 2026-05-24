@@ -45,8 +45,13 @@ for _candidate in ("/usr/lib/ratan-classifier", os.path.dirname(_SELF)):
         break
 
 from classifier.fsm import FsmConfig, Sample, State, WanFsm
+from classifier.handover import HandoverPredictor
 
 DEFAULT_CONFIG_PATH = "/etc/ratan/classifier.json"
+DEFAULT_HANDOVER_STATUS_PATH = "/run/ratan/handover-status.json"
+HANDOVER_STATUS_WRITE_INTERVAL_S = 1.0   # cap to once/sec; the file is
+                                          # also force-written on every
+                                          # lock-state change (see below)
 
 # Wire formats: must match ratan_proto.h exactly.
 RATAN_PROTO_VERSION = 1
@@ -83,6 +88,10 @@ DEFAULT_CONFIG = {
         "map_path": "/sys/fs/bpf/ratan/path_weights",
         "use_bpftool": True,
     },
+    "handover": {
+        "enabled": True,
+        "status_file": DEFAULT_HANDOVER_STATUS_PATH,
+    },
 }
 
 
@@ -94,7 +103,7 @@ def load_config(path: str) -> dict:
         user = {}
     # shallow merge per top-level key
     cfg = {**DEFAULT_CONFIG, **user}
-    for k in ("fsm", "telemetry", "bpf"):
+    for k in ("fsm", "telemetry", "bpf", "handover"):
         cfg[k] = {**DEFAULT_CONFIG[k], **user.get(k, {})}
     return cfg
 
@@ -207,9 +216,20 @@ class Orchestrator:
     def __init__(self, cfg: dict, no_bpf: bool):
         self.cfg = cfg
         self.stop = False
+        self._last_status_write = 0.0
 
         fsm_cfg = FsmConfig(**cfg["fsm"])
-        # wan_id -> WanFsm (use subflow_idx as wan_id everywhere internal)
+        wan_ids = [int(w["subflow_idx"]) for w in cfg["wans"]]
+
+        # The handover predictor is the shared `preempter` for every WAN's
+        # FSM. It receives every sample (regardless of wan) so it can
+        # learn each WAN's cadence independently, and exposes
+        # is_about_to_handover(wan_id) which the FSM polls on every sample.
+        self.handover_enabled = bool(cfg["handover"].get("enabled", True))
+        self.handover = HandoverPredictor(wan_ids=wan_ids) if self.handover_enabled else None
+        self.handover_status_file = cfg["handover"].get(
+            "status_file", DEFAULT_HANDOVER_STATUS_PATH)
+
         self.fsms: Dict[int, WanFsm] = {}
         self.wan_names: Dict[int, str] = {}
         for w in cfg["wans"]:
@@ -219,6 +239,7 @@ class Orchestrator:
                 capacity_mbps=float(w.get("capacity_mbps", 100)),
                 cfg=fsm_cfg,
                 baseline_weight=int(w.get("baseline_weight", fsm_cfg.baseline_weight)),
+                preempter=self.handover,
             )
             self.wan_names[idx] = w.get("name", f"wan{idx}")
 
@@ -254,7 +275,18 @@ class Orchestrator:
             rtt_us=ev.get("rtt_us", 0),
             jitter_us=ev.get("jitter_us", 0),
         )
+        # IMPORTANT: feed predictor BEFORE the FSM, so its arm() state is
+        # up-to-date when the FSM polls is_about_to_handover(). The
+        # ordering matters: predictor first sees the sample, may update
+        # its prediction window; then FSM consults preempter via that
+        # same window during _evaluate_transitions().
+        if self.handover is not None:
+            self.handover.on_sample(sample)
+
         tr = self.fsms[wan_id].on_sample(sample)
+        # Force a status update on every state transition so the file
+        # captures the interesting moments without being throttled.
+        self._maybe_write_status(force=tr is not None and tr.from_state != tr.to_state)
         if tr is None:
             return
 
@@ -270,16 +302,42 @@ class Orchestrator:
             self.tx.weight(tr.ts_ns, wan_id, tr.new_weight, "predict")
             self.bpf.write(wan_id, tr.new_weight)
 
+    def _maybe_write_status(self, force: bool = False):
+        """Periodic snapshot of the handover predictor's state to
+        /run/ratan/handover-status.json so the UI (and curl) can see
+        what it thinks. Throttled to HANDOVER_STATUS_WRITE_INTERVAL_S
+        unless `force=True` (used on every state transition to keep the
+        file fresh during interesting moments)."""
+        if self.handover is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_status_write < HANDOVER_STATUS_WRITE_INTERVAL_S:
+            return
+        self._last_status_write = now
+        snap = self.handover.status_snapshot()
+        snap["wrote_at_wall"] = time.time()
+        path = self.handover_status_file
+        tmp = path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(tmp, "w") as f:
+                json.dump(snap, f, indent=2)
+            os.replace(tmp, path)
+        except OSError as e:
+            log.debug("status write failed: %s", e)
+
     def run(self):
         signal.signal(signal.SIGINT,  self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
 
-        log.info("classifier starting; %d WAN(s): %s",
+        log.info("classifier starting; %d WAN(s): %s; handover_predictor=%s",
                  len(self.fsms),
                  ", ".join(f"{n}(idx={i},w={f.baseline_weight})"
                            for i, (n, f) in
-                           enumerate(zip(self.wan_names.values(), self.fsms.values()))))
+                           enumerate(zip(self.wan_names.values(), self.fsms.values()))),
+                 "on" if self.handover_enabled else "off")
         self.initialize_weights()
+        self._maybe_write_status()  # write an initial empty snapshot
 
         for ev in sse_events(self.cfg["telemetry"]["stream_url"], self._stop_check):
             self.handle_sample(ev)
