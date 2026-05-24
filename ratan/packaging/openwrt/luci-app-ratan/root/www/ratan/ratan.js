@@ -381,10 +381,30 @@
       if (!lastRttPushTs[w.wan] || now - lastRttPushTs[w.wan] >= 950) {
         if (w.rtt_us > 0) w.rttHist.push(w.rtt_us);
         if (w.rttHist.length > 60) w.rttHist.shift();
-        // bpsHist placeholder until per-WAN traffic stats land
+        lastRttPushTs[w.wan] = now;
+      }
+    }
+  }
+
+  async function pollWanStats() {
+    let d;
+    try { d = await getJSON('/wan-stats'); } catch { return; }
+    if (!d || !d.wans) return;
+    const now = Date.now();
+    for (const incoming of d.wans) {
+      const w = ensureWan(incoming.wan_id);
+      // Override iface/label from authoritative stats source (set via
+      // --wan flag on the daemon, typically mirrored from prober UCI).
+      if (incoming.iface) w.iface = incoming.iface;
+      if (incoming.label) w.label = incoming.label;
+      // bps = rx + tx (aggregate per WAN -- matches the design's bps field)
+      w.bps = (incoming.rx_bps || 0) + (incoming.tx_bps || 0);
+      w.rx_bps = incoming.rx_bps || 0;
+      w.tx_bps = incoming.tx_bps || 0;
+      if (!w._lastBpsPush || now - w._lastBpsPush >= 950) {
         w.bpsHist.push(w.bps);
         if (w.bpsHist.length > 60) w.bpsHist.shift();
-        lastRttPushTs[w.wan] = now;
+        w._lastBpsPush = now;
       }
     }
   }
@@ -505,7 +525,7 @@
 
   function startPolling() {
     // initial burst
-    pollHealth(); pollMetrics(); pollWans();
+    pollHealth(); pollMetrics(); pollWans(); pollWanStats();
     pollHandover(); pollSessions(); pollFlows();
     pollDiscovery(); pollEvents();
 
@@ -513,6 +533,7 @@
     setInterval(pollHealth,    5000);
     setInterval(pollMetrics,   1000);
     setInterval(pollWans,      1000);
+    setInterval(pollWanStats,  1000);
     setInterval(pollHandover,  1000);
     setInterval(pollSessions,  5000);
     setInterval(pollFlows,     3000);

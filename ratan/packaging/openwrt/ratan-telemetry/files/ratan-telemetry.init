@@ -38,6 +38,19 @@ start_service() {
 		--lease-file "$lease" \
 		--foreground
 
+	# Mirror the prober's WAN config so /wan-stats can map subflow_idx -> iface
+	# for the per-WAN throughput chart on the dashboard.
+	add_wan() {
+		local sect="$1" iface idx
+		config_get iface "$sect" iface ''
+		config_get idx   "$sect" subflow_idx ''
+		[ -n "$iface" ] && [ -n "$idx" ] && \
+			procd_append_param command --wan "${idx}:${iface}:${sect}"
+	}
+	# Note: this depends on /etc/config/ratan-prober being readable.
+	config_load 'ratan-prober' 2>/dev/null && config_foreach add_wan wan
+	config_load 'ratan-telemetry'
+
 	procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-0}
 	procd_set_param stdout 1
 	procd_set_param stderr 1

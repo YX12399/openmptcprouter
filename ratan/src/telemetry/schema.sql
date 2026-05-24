@@ -66,7 +66,9 @@ CREATE TABLE IF NOT EXISTS flows (
     event        TEXT NOT NULL,        -- 'flow_start' | 'flow_end' | 'flow_update'
     five_tuple   TEXT NOT NULL,        -- "proto:srcip:srcport-dstip:dstport"
     category     TEXT,                 -- nDPI category, e.g. 'VideoCall/Teams'
-    mark         INTEGER
+    mark         INTEGER,
+    bytes_orig   INTEGER DEFAULT 0,    -- counters from CTA_COUNTERS_ORIG (Step 11a polish)
+    bytes_reply  INTEGER DEFAULT 0     -- counters from CTA_COUNTERS_REPLY
 );
 CREATE INDEX IF NOT EXISTS flows_ts_idx ON flows(ts_ns);
 

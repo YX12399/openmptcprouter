@@ -183,17 +183,26 @@ returns coherent per-WAN snapshot; `/events?since=0` returns mixed-kind
 recent timeline; `/handover-status.json` reaches the static path; session
 create/stop/delete round-trip through `api.*`.
 
-**Known display gaps** (carry-forward, not commit-blocking):
-- **Per-WAN throughput chart** on the Overview page renders empty until
-  we add a `/wan-stats` endpoint that reads
-  `/sys/class/net/<iface>/statistics/{rx_bytes,tx_bytes}` (and maps
-  subflow_idx → iface from `/etc/config/ratan-prober`).
-- **Per-flow byte counters** are 0 in the Flows table because the
-  `flows` SQLite table doesn't yet persist the byte counters that
-  arrive on the wire (a Step 4b loose end).
-- **Real SSE** still deferred behind shell-CGI's buffering; the Live
-  page polls `/events?since=` instead. Public API doesn't change when
-  SSE eventually lands.
+**Known display gaps** — *two of the three closed in the Step 11 polish round*:
+- ~~**Per-WAN throughput chart** on the Overview page renders empty~~ ✓
+  **Closed by `/wan-stats` endpoint** that reads
+  `/sys/class/net/<iface>/statistics/{rx,tx}_bytes` and computes bps
+  from delta-bytes / delta-time vs the previous snapshot. The
+  procd init mirrors prober's UCI to pass `--wan idx:iface:label`
+  flags to the daemon. Adapter polls `/wan-stats` at 1s and fills
+  `STATE.wans[i].{bps, rx_bps, tx_bps, bpsHist}`.
+- ~~**Per-flow byte counters** are 0~~ ✓
+  **Closed by schema migration**: `flows` table gained `bytes_orig`
+  and `bytes_reply` columns (idempotent `ALTER TABLE` for old DBs);
+  `on_flow()` now persists them; `/flows` returns the per-tuple
+  `MAX(bytes_*)` so the UI shows the freshest non-zero counters.
+- **Real SSE** still deferred — getting true streaming through shell
+  CGI requires modifying `/etc/config/uhttpd` (a url-rewrite to
+  `127.0.0.1:9180`), which would touch upstream OMR config. 1s
+  polling against `/events?since=` is invisible to users and keeps
+  us at zero OMR modifications. We'll add an opt-in `uhttpd` config
+  fragment alongside the package later if anyone needs sub-100ms
+  latency on the Live page.
 
 ### Step 11 complete. What we can do today:
 

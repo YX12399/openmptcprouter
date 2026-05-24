@@ -31,6 +31,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <inttypes.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -63,6 +64,25 @@
 #define DEFAULT_SCHEMA_PATH   "/usr/share/ratan/schema.sql"
 #define DEFAULT_LEASE_FILE    "/tmp/dhcp.leases"
 #define DEFAULT_NDPI_CATS     "/etc/ratan/ndpi-categories.conf"
+
+/* ---------- WAN iface stats (read from /sys/class/net/<iface>/statistics) -- */
+
+#define MAX_WAN_MAP 8
+
+struct wan_snap {
+	int      wan_id;
+	char     iface[32];
+	char     label[40];
+	uint64_t rx_bytes;       /* cumulative from sysfs */
+	uint64_t tx_bytes;
+	uint64_t snap_ts_ns;     /* CLOCK_MONOTONIC at last sample */
+	uint64_t rx_bps;         /* computed from delta */
+	uint64_t tx_bps;
+	bool     has_prev;
+};
+
+static struct wan_snap g_wan_map[MAX_WAN_MAP];
+static int             g_n_wan_map = 0;
 
 #define MAX_HTTP_CLIENTS      32
 #define HTTP_REQ_MAX          8192
@@ -169,6 +189,17 @@ static int db_init(const char *path, const char *schema_path)
 		LOGW("schema file %s not readable; assuming DB is pre-initialized", schema_path);
 	}
 
+	/* Idempotent column additions for older DBs (greenfield DBs already
+	 * have these columns via schema.sql; the ALTER will fail with
+	 * "duplicate column name" which we ignore). SQLite has no
+	 * IF NOT EXISTS for ADD COLUMN, so we just try-and-ignore. */
+	(void)sqlite3_exec(g_db,
+		"ALTER TABLE flows ADD COLUMN bytes_orig INTEGER DEFAULT 0",
+		NULL, NULL, NULL);
+	(void)sqlite3_exec(g_db,
+		"ALTER TABLE flows ADD COLUMN bytes_reply INTEGER DEFAULT 0",
+		NULL, NULL, NULL);
+
 	const char *prepares[] = {
 		"INSERT INTO samples(ts_ns,wan_id,event,seq,rtt_us,loss_count,jitter_us,session_id) "
 		"VALUES (?,?,?,?,?,?,?,?)",
@@ -184,8 +215,8 @@ static int db_init(const char *path, const char *schema_path)
 
 		"INSERT INTO discovery(ts_ns,kind,detail) VALUES (?,?,?)",
 
-		"INSERT INTO flows(ts_ns,event,five_tuple,category,mark) "
-		"VALUES (?,?,?,?,?)",
+		"INSERT INTO flows(ts_ns,event,five_tuple,category,mark,bytes_orig,bytes_reply) "
+		"VALUES (?,?,?,?,?,?,?)",
 
 		"INSERT INTO mos(ts_ns,flow_id,mos,rtt_ms,loss_pct,jitter_ms,session_id) "
 		"VALUES (?,?,?,?,?,?,?)",
@@ -457,6 +488,8 @@ static void on_flow(const struct ratan_flow_event *e)
 	sqlite3_bind_text (g_st_ins_flow, 3, five,         -1, SQLITE_TRANSIENT);
 	sqlite3_bind_text (g_st_ins_flow, 4, e->category,  -1, SQLITE_TRANSIENT);
 	sqlite3_bind_int  (g_st_ins_flow, 5, (int)e->mark);
+	sqlite3_bind_int64(g_st_ins_flow, 6, (sqlite3_int64)e->bytes_orig);
+	sqlite3_bind_int64(g_st_ins_flow, 7, (sqlite3_int64)e->bytes_reply);
 	if (sqlite3_step(g_st_ins_flow) != SQLITE_DONE)
 		LOGW("ins_flow: %s", sqlite3_errmsg(g_db));
 
@@ -1098,8 +1131,15 @@ static void route_flows_list(int fd, int limit)
 {
 	if (limit <= 0 || limit > 2000) limit = 200;
 	sqlite3_stmt *st;
-	const char *q = "SELECT ts_ns,event,five_tuple,category,mark FROM flows "
-			"ORDER BY ts_ns DESC LIMIT ?";
+	/* Per-five-tuple latest row with the LARGEST byte counters seen.
+	 * CTNETLINK NEW typically arrives with bytes=0; bytes accumulate
+	 * on the kernel side and DESTROY brings the final totals. Showing
+	 * the max across rows for the same flow gives the UI the freshest
+	 * useful numbers without bookkeeping on the daemon side. */
+	const char *q =
+		"SELECT MAX(ts_ns), MAX(event), five_tuple, MAX(category), "
+		"  MAX(mark), MAX(bytes_orig), MAX(bytes_reply) "
+		"FROM flows GROUP BY five_tuple ORDER BY MAX(ts_ns) DESC LIMIT ?";
 	if (sqlite3_prepare_v2(g_db, q, -1, &st, NULL) != SQLITE_OK) {
 		send_status(fd, 500, "text/plain", "", 0); return;
 	}
@@ -1123,12 +1163,91 @@ static void route_flows_list(int fd, int limit)
 			(const char *)sqlite3_column_text(st, 3));
 		len += snprintf(out + len, 65536 - len,
 			"{\"ts_ns\":%lld,\"event\":\"%s\",\"five_tuple\":\"%s\","
-			"\"category\":\"%s\",\"mark\":%d}",
+			"\"category\":\"%s\",\"mark\":%d,"
+			"\"bytes_orig\":%lld,\"bytes_reply\":%lld}",
 			(long long)sqlite3_column_int64(st, 0),
-			esc_ev, esc_ft, esc_cat, sqlite3_column_int(st, 4));
+			esc_ev, esc_ft, esc_cat, sqlite3_column_int(st, 4),
+			(long long)sqlite3_column_int64(st, 5),
+			(long long)sqlite3_column_int64(st, 6));
 	}
 	len += snprintf(out + len, 65536 - len, "]}");
 	sqlite3_finalize(st);
+	send_status(fd, 200, "application/json", out, len);
+	free(out);
+}
+
+/* Read /sys/class/net/<iface>/statistics/<which>_bytes; return 0 on miss. */
+static uint64_t sysfs_iface_bytes(const char *iface, const char *which)
+{
+	char p[256];
+	snprintf(p, sizeof(p), "/sys/class/net/%s/statistics/%s_bytes", iface, which);
+	FILE *f = fopen(p, "r");
+	if (!f) return 0;
+	uint64_t v = 0;
+	if (fscanf(f, "%" SCNu64, &v) != 1) v = 0;
+	fclose(f);
+	return v;
+}
+
+/* GET /wan-stats -- per-WAN throughput. Reads current rx/tx byte counters
+ * from sysfs for each configured iface and computes bps as delta-bytes /
+ * delta-time since the previous call. Throttles re-sampling to >= 200ms
+ * so two rapid back-to-back requests don't return wildly different rates. */
+static void route_wan_stats(int fd)
+{
+	uint64_t now = now_ns();
+	char *out = malloc(8192);
+	if (!out) { send_status(fd, 500, "text/plain", "", 0); return; }
+	size_t len = 0;
+	len += snprintf(out + len, 8192 - len, "{\"wans\":[");
+
+	bool first = true;
+	for (int i = 0; i < g_n_wan_map; i++) {
+		struct wan_snap *s = &g_wan_map[i];
+		uint64_t rx = sysfs_iface_bytes(s->iface, "rx");
+		uint64_t tx = sysfs_iface_bytes(s->iface, "tx");
+
+		/* Compute rate only if previous snapshot is >=200ms old; else
+		 * keep the previously-computed rate (avoids divide-by-tiny noise). */
+		if (s->has_prev) {
+			uint64_t dt_ns = now - s->snap_ts_ns;
+			if (dt_ns >= 200ULL * 1000000) {
+				/* uint64 subtraction handles 32-bit counter wraparound on 64-bit
+				 * sysfs counters by sheer accident -- modern kernels return 64-bit
+				 * everywhere we care about. */
+				uint64_t drx = rx - s->rx_bytes;
+				uint64_t dtx = tx - s->tx_bytes;
+				s->rx_bps = (drx * 1000000000ULL) / dt_ns;
+				s->tx_bps = (dtx * 1000000000ULL) / dt_ns;
+				s->rx_bytes = rx;
+				s->tx_bytes = tx;
+				s->snap_ts_ns = now;
+			}
+		} else {
+			s->rx_bytes = rx;
+			s->tx_bytes = tx;
+			s->snap_ts_ns = now;
+			s->has_prev = true;
+			s->rx_bps = 0;
+			s->tx_bps = 0;
+		}
+
+		if (!first) len += snprintf(out + len, 8192 - len, ",");
+		first = false;
+		char esc_iface[40], esc_label[48];
+		json_escape(esc_iface, sizeof(esc_iface), s->iface);
+		json_escape(esc_label, sizeof(esc_label), s->label);
+		len += snprintf(out + len, 8192 - len,
+			"{\"wan_id\":%d,\"iface\":\"%s\",\"label\":\"%s\","
+			"\"rx_bytes\":%llu,\"tx_bytes\":%llu,"
+			"\"rx_bps\":%llu,\"tx_bps\":%llu,"
+			"\"snap_ts_ns\":%llu}",
+			s->wan_id, esc_iface, esc_label,
+			(unsigned long long)rx,    (unsigned long long)tx,
+			(unsigned long long)s->rx_bps, (unsigned long long)s->tx_bps,
+			(unsigned long long)now);
+	}
+	len += snprintf(out + len, 8192 - len, "]}");
 	send_status(fd, 200, "application/json", out, len);
 	free(out);
 }
@@ -1461,6 +1580,9 @@ static void http_handle(int idx)
 	if (!strcmp(method, "GET") && !strcmp(path, "/wans")) {
 		route_wans_snapshot(c->fd); http_drop(idx); return;
 	}
+	if (!strcmp(method, "GET") && !strcmp(path, "/wan-stats")) {
+		route_wan_stats(c->fd); http_drop(idx); return;
+	}
 	if (!strcmp(method, "GET") &&
 	    (!strcmp(path, "/events") || !strncmp(path, "/events?", 8))) {
 		int64_t since = 0;
@@ -1595,6 +1717,9 @@ static void usage(const char *me)
 "  --no-mos           don't spawn the MOS computer thread\n"
 "  --mos-category G   substring match for which flows get MOS scored\n"
 "                     (default \"VideoCall/\" -- matches Teams/Zoom/Meet)\n"
+"  --wan ID:IFACE[:LABEL]  repeatable. Maps a subflow_idx to a Linux\n"
+"                     iface name (for /wan-stats throughput). Optional\n"
+"                     label is for the UI (defaults to IFACE).\n"
 "  --foreground\n",
 		me, DEFAULT_DB_PATH, DEFAULT_SCHEMA_PATH, DEFAULT_SOCK_PATH,
 		DEFAULT_HTTP_HOST, DEFAULT_HTTP_PORT,
@@ -1616,7 +1741,7 @@ int main(int argc, char **argv)
 	const char *mos_category  = "VideoCall/";
 
 	enum { OPT_LEASE = 256, OPT_NODISC, OPT_NDPI, OPT_NOFLOW,
-	       OPT_NOMOS, OPT_MOSCAT };
+	       OPT_NOMOS, OPT_MOSCAT, OPT_WAN };
 	static const struct option opts[] = {
 		{ "db",            required_argument, 0, 'd' },
 		{ "schema",        required_argument, 0, 'C' },
@@ -1629,6 +1754,7 @@ int main(int argc, char **argv)
 		{ "no-flowtrack",  no_argument,       0, OPT_NOFLOW },
 		{ "no-mos",        no_argument,       0, OPT_NOMOS },
 		{ "mos-category",  required_argument, 0, OPT_MOSCAT },
+		{ "wan",           required_argument, 0, OPT_WAN },
 		{ "foreground",    no_argument,       0, 'f' },
 		{ "help",          no_argument,       0, 'h' },
 		{ 0 }
@@ -1647,6 +1773,27 @@ int main(int argc, char **argv)
 		case OPT_NOFLOW: run_flowtrack = false; break;
 		case OPT_NOMOS:  run_mos = false; break;
 		case OPT_MOSCAT: mos_category = optarg; break;
+		case OPT_WAN: {
+			/* Parse "ID:IFACE[:LABEL]" -- e.g. "0:wan0:Starlink" */
+			if (g_n_wan_map >= MAX_WAN_MAP) {
+				fprintf(stderr, "too many --wan entries (max %d)\n", MAX_WAN_MAP);
+				return 1;
+			}
+			struct wan_snap *m = &g_wan_map[g_n_wan_map];
+			char *spec = strdup(optarg);
+			if (!spec) return 1;
+			char *p1 = strchr(spec, ':');
+			if (!p1) { fprintf(stderr, "bad --wan: %s\n", optarg); free(spec); return 1; }
+			*p1++ = '\0';
+			m->wan_id = atoi(spec);
+			char *p2 = strchr(p1, ':');
+			if (p2) *p2++ = '\0';
+			strncpy(m->iface, p1, sizeof(m->iface) - 1);
+			strncpy(m->label, p2 ? p2 : m->iface, sizeof(m->label) - 1);
+			g_n_wan_map++;
+			free(spec);
+			break;
+		}
 		case 'f': g_foreground = true; break;
 		case 'h': default: usage(argv[0]); return c == 'h' ? 0 : 1;
 		}
