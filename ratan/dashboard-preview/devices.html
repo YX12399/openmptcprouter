@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>RATAN · Devices</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="ratan.css" />
+  <style>
+    .dev-summary {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .dev-tile {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--r);
+      padding: 14px 16px;
+    }
+    .dev-tile .lbl {
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--fg-2);
+      margin-bottom: 6px;
+    }
+    .dev-tile .v {
+      font-family: var(--mono);
+      font-size: 22px;
+      font-weight: 500;
+      color: var(--fg);
+    }
+    .dev-tile .sub { font-family:var(--mono); font-size:10px; color: var(--fg-3); margin-top: 4px; }
+    @media (max-width: 768px) { .dev-summary { grid-template-columns: 1fr 1fr; } }
+
+    .live-dot {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--fg-4);
+      vertical-align: middle;
+      margin-right: 5px;
+    }
+    .live-dot.online { background: var(--healthy); box-shadow: 0 0 6px var(--healthy); }
+    .live-dot.idle   { background: var(--degrading); }
+    .live-dot.offline{ background: var(--fg-4); }
+
+    .filter-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--bg-1);
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--fg-2);
+    }
+    .filter-row input {
+      background: var(--surface);
+      border: 1px solid var(--line-2);
+      border-radius: var(--r-sm);
+      padding: 5px 9px;
+      color: var(--fg);
+      font-family: var(--mono);
+      font-size: 11px;
+      width: 280px;
+      outline: none;
+    }
+
+    .vendor-chip {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--fg-2);
+      background: var(--surface-2);
+      border: 1px solid var(--line-2);
+      padding: 1px 5px;
+      border-radius: 3px;
+    }
+  </style>
+</head>
+<body>
+  <div id="nav-slot" data-screen-label="06 Devices"></div>
+
+  <main class="page">
+    <header class="page-head">
+      <div>
+        <div class="page-title">Devices</div>
+        <div class="page-sub">netlink discovery · br-lan · dhcp lease database</div>
+      </div>
+      <div class="page-head-actions">
+        <span style="font-family:var(--mono); font-size:11px; color:var(--fg-2);">
+          poll <span style="color:var(--fg);">5.0s</span>
+        </span>
+        <button class="btn" id="refresh-btn">Refresh</button>
+      </div>
+    </header>
+
+    <section class="dev-summary">
+      <div class="dev-tile">
+        <div class="lbl">total clients</div>
+        <div class="v" id="d-total">0</div>
+        <div class="sub">ever seen</div>
+      </div>
+      <div class="dev-tile">
+        <div class="lbl">online now</div>
+        <div class="v" id="d-online" style="color: var(--healthy);">0</div>
+        <div class="sub">seen &lt; 30s ago</div>
+      </div>
+      <div class="dev-tile">
+        <div class="lbl">idle</div>
+        <div class="v" id="d-idle" style="color: var(--degrading);">0</div>
+        <div class="sub">30s – 5min</div>
+      </div>
+      <div class="dev-tile">
+        <div class="lbl">offline</div>
+        <div class="v" id="d-offline" style="color: var(--fg-2);">0</div>
+        <div class="sub">&gt; 5 min</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="filter-row">
+        <span>filter</span>
+        <input id="search" placeholder="ip · mac · hostname" />
+        <span style="flex:1;"></span>
+        <span><span id="visible-n">0</span> of <span id="total-n">0</span> clients</span>
+      </div>
+
+      <table class="table compact">
+        <thead>
+          <tr>
+            <th style="width: 24px;"></th>
+            <th class="mono" style="width: 160px;">ip</th>
+            <th class="mono" style="width: 180px;">mac</th>
+            <th>hostname</th>
+            <th style="width: 100px;">vendor</th>
+            <th class="mono" style="width: 140px;">last seen</th>
+            <th class="mono" style="width: 90px; text-align:right;">rssi</th>
+          </tr>
+        </thead>
+        <tbody id="dev-body"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="ratan.js"></script>
+  <script>
+    RATAN.mountNav('devices');
+    const { STATE, fmt } = RATAN;
+
+    const VENDORS = {
+      '8c:85:90': 'Apple',
+      '3a:f1:a2': 'Apple',
+      'b8:27:eb': 'Raspberry Pi',
+      '94:c6:91': 'Lenovo',
+      'fc:fb:fb': 'Ubiquiti',
+      '00:1e:c0': 'TP-Link',
+      'aa:bb:cc': 'QEMU',
+    };
+
+    function statusOf(d) {
+      const age = (Date.now() - d.last_seen) / 1000;
+      if (age < 30) return 'online';
+      if (age < 300) return 'idle';
+      return 'offline';
+    }
+
+    function passes(d) {
+      const q = document.getElementById('search').value.trim().toLowerCase();
+      if (!q) return true;
+      return `${d.ip} ${d.mac} ${d.hostname}`.toLowerCase().includes(q);
+    }
+
+    function render() {
+      const all = STATE.devices.slice().sort((a, b) => b.last_seen - a.last_seen);
+      const list = all.filter(passes);
+      document.getElementById('dev-body').innerHTML = list.map(d => {
+        const st = statusOf(d);
+        const oui = d.mac.slice(0, 8);
+        const vendor = VENDORS[oui] || 'Unknown';
+        const rssi = -45 - Math.floor(Math.random() * 30);
+        return `<tr>
+          <td><span class="live-dot ${st}"></span></td>
+          <td class="mono">${d.ip}</td>
+          <td class="mono" style="color: var(--fg-2);">${d.mac}</td>
+          <td>${d.hostname}</td>
+          <td><span class="vendor-chip">${vendor}</span></td>
+          <td class="mono" style="color: var(--fg-2);">${fmt.ago(d.last_seen)}</td>
+          <td class="mono" style="color: ${rssi > -60 ? 'var(--healthy)' : rssi > -70 ? 'var(--degrading)' : 'var(--down)'};">${rssi} dBm</td>
+        </tr>`;
+      }).join('');
+
+      document.getElementById('visible-n').textContent = list.length;
+      document.getElementById('total-n').textContent = all.length;
+      document.getElementById('d-total').textContent = all.length;
+      document.getElementById('d-online').textContent  = all.filter(d => statusOf(d) === 'online').length;
+      document.getElementById('d-idle').textContent    = all.filter(d => statusOf(d) === 'idle').length;
+      document.getElementById('d-offline').textContent = all.filter(d => statusOf(d) === 'offline').length;
+    }
+    render();
+
+    document.getElementById('search').addEventListener('input', render);
+    document.getElementById('refresh-btn').addEventListener('click', () => {
+      // nudge a couple of last_seen forward, simulating a re-discovery
+      STATE.devices.slice(0, 3).forEach(d => d.last_seen = Date.now() - Math.random() * 5000);
+      render();
+    });
+
+    setInterval(render, 2000);
+  </script>
+</body>
+</html>
