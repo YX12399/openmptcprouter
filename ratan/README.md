@@ -24,7 +24,7 @@ ratan/
 └── scripts/                        build wrappers                                  [STEP 10]
 ```
 
-## Current state — Steps 1–5, 8a, 9, 11 of 17
+## Current state — Steps 1–5, 8a/8c, 9, 11 of 17
 
 > **RATAN coexists with LuCI.** The standard LuCI admin (wizards, WAN/LAN
 > config, firewall, system status, syslog, backup, OpenMPTCProuter status,
@@ -173,6 +173,26 @@ config (1.5 Mbps floor + 200 Mbps Starlink + 50 Mbps cellular).
 **Validation recipe already shipped** — `ratan-test record --recipe qos_isolation`
 asserts MOS stays ≥3.5 throughout an induced WAN drop while bulk
 iperf3 + Teams call are active.
+
+Shipped (Step 8c, QoS dashboard page):
+- New `/qos-status` endpoint in the telemetry daemon — shells out to
+  `tc -j -s class show dev <iface>` per configured WAN (the same
+  iface set we already pass via `--wan` for `/wan-stats`), wraps each
+  iface's tc JSON inside `{wan_id, iface, label, classes}`. Iface
+  names validated against a strict allowlist before shell-out.
+- New `qos.html` dashboard page (under **Network → RATAN → QoS**)
+  with per-WAN cards: each class (realtime / bulk / background)
+  gets a horizontal bar showing current usage vs the configured
+  ceiling, a notch marking the floor, plus sent-bytes / drops /
+  overlimits counters. Drops are colored red when > 0.
+- Per-class current rate computed in-browser as delta of
+  `stats.bytes` between 2s polls (no extra backend math needed).
+- `qos` added to PAGES in `ratan.js` and to the LuCI menu.
+
+Verified in container: `/qos-status` returns valid JSON envelope
+with `classes: []` (no tc in container); on the real router with
+`/etc/init.d/ratan-qos start` first, the classes populate with
+1:10 / 1:20 / 1:30 + their tc stats.
 
 Shipped (Step 11, LuCI dashboard — design integration):
 

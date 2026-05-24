@@ -39,5 +39,10 @@
 		"title": "Devices",
 		"order": 6,
 		"action": { "type": "view", "path": "ratan/devices" }
+	},
+	"admin/network/ratan/qos": {
+		"title": "QoS",
+		"order": 7,
+		"action": { "type": "view", "path": "ratan/qos" }
 	}
 }

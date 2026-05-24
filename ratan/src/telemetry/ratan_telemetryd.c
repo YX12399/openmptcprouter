@@ -1189,6 +1189,76 @@ static uint64_t sysfs_iface_bytes(const char *iface, const char *which)
 	return v;
 }
 
+/* GET /qos-status -- shells out to `tc -j -s class show dev <iface>` per
+ * configured WAN and merges the per-iface JSON arrays into one envelope
+ * the dashboard's QoS page consumes. tc must be in PATH (it is on
+ * OpenWrt). Per-request shell-out is fine: tc is microseconds, the page
+ * polls at 2s. Iface names are validated against a strict allowlist
+ * before being interpolated into the shell command. */
+static bool iface_name_safe(const char *s)
+{
+	if (!s || !*s || strlen(s) > 31) return false;
+	for (; *s; s++) {
+		if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') ||
+		      (*s >= '0' && *s <= '9') || *s == '_' || *s == '.' || *s == '-'))
+			return false;
+	}
+	return true;
+}
+
+static void route_qos_status(int fd)
+{
+	char *out = malloc(65536);
+	if (!out) { send_status(fd, 500, "text/plain", "", 0); return; }
+	size_t len = 0;
+	len += snprintf(out + len, 65536 - len, "{\"wans\":[");
+
+	bool first = true;
+	for (int i = 0; i < g_n_wan_map; i++) {
+		struct wan_snap *s = &g_wan_map[i];
+		if (!iface_name_safe(s->iface)) continue;
+
+		char cmd[160];
+		snprintf(cmd, sizeof(cmd),
+			"tc -j -s class show dev '%s' 2>/dev/null", s->iface);
+		FILE *p = popen(cmd, "r");
+		char tc_buf[16384];
+		size_t tc_len = 0;
+		if (p) {
+			size_t n;
+			while ((n = fread(tc_buf + tc_len, 1, sizeof(tc_buf) - 1 - tc_len, p)) > 0)
+				tc_len += n;
+			pclose(p);
+			tc_buf[tc_len] = '\0';
+		} else {
+			tc_buf[0] = '\0';
+		}
+		/* Trim trailing newline. */
+		while (tc_len > 0 && (tc_buf[tc_len-1] == '\n' || tc_buf[tc_len-1] == '\r'))
+			tc_buf[--tc_len] = '\0';
+		if (tc_len == 0) {
+			snprintf(tc_buf, sizeof(tc_buf), "[]");
+			tc_len = 2;
+		}
+
+		char esc_iface[40], esc_label[48];
+		json_escape(esc_iface, sizeof(esc_iface), s->iface);
+		json_escape(esc_label, sizeof(esc_label), s->label);
+		if (!first) len += snprintf(out + len, 65536 - len, ",");
+		first = false;
+		/* Emit the tc JSON array as-is (it's already valid JSON). */
+		if (65536 - len > tc_len + 256) {
+			len += snprintf(out + len, 65536 - len,
+				"{\"wan_id\":%d,\"iface\":\"%s\",\"label\":\"%s\","
+				"\"classes\":%s}",
+				s->wan_id, esc_iface, esc_label, tc_buf);
+		}
+	}
+	len += snprintf(out + len, 65536 - len, "]}");
+	send_status(fd, 200, "application/json", out, len);
+	free(out);
+}
+
 /* GET /wan-stats -- per-WAN throughput. Reads current rx/tx byte counters
  * from sysfs for each configured iface and computes bps as delta-bytes /
  * delta-time since the previous call. Throttles re-sampling to >= 200ms
@@ -1582,6 +1652,9 @@ static void http_handle(int idx)
 	}
 	if (!strcmp(method, "GET") && !strcmp(path, "/wan-stats")) {
 		route_wan_stats(c->fd); http_drop(idx); return;
+	}
+	if (!strcmp(method, "GET") && !strcmp(path, "/qos-status")) {
+		route_qos_status(c->fd); http_drop(idx); return;
 	}
 	if (!strcmp(method, "GET") &&
 	    (!strcmp(path, "/events") || !strncmp(path, "/events?", 8))) {

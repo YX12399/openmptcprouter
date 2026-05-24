@@ -203,6 +203,7 @@
     { id: 'handover',  href: 'handover.html',  label: 'Handover' },
     { id: 'flows',     href: 'flows.html',     label: 'Flows' },
     { id: 'devices',   href: 'devices.html',   label: 'Devices' },
+    { id: 'qos',       href: 'qos.html',       label: 'QoS' },
   ];
 
   // LuCI quick-links. RATAN COEXISTS with LuCI -- we don't replace it.
