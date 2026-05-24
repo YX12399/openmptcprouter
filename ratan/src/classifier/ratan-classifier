@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
+"""ratan-classifier -- per-WAN Starlink-aware state classifier.
+
+Reads samples from the telemetry daemon's SSE /stream, runs them through
+a per-WAN FSM (see fsm.py), and acts on transitions by:
+  - writing RATAN_EVENT_STATE + RATAN_EVENT_WEIGHT envelopes back to the
+    telemetry socket (so the daemon persists + broadcasts symmetrically),
+  - writing the new weight into the pinned BPF map via bpftool.
+
+The prober owns the sub-200ms fast-failover path (writes weight=0 at 3
+consecutive losses); the classifier owns smart degradation, recovery,
+and the smooth weight decay schedule.
+
+Config:
+  /etc/ratan/classifier.json (defaults baked in if missing).
+
+Usage:
+  ratan-classifier
+  ratan-classifier --foreground --no-bpf  (dev box: skip bpftool writes)
+"""
+
+import argparse
+import json
+import logging
+import os
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Dict, Optional
+
+# Locate the classifier modules. Two layouts:
+#   /usr/lib/ratan-classifier/classifier/{fsm,ewma}.py   (installed via opkg)
+#   <repo>/src/classifier/{fsm,ewma}.py                  (dev / source tree)
+_SELF = os.path.dirname(os.path.abspath(__file__))
+for _candidate in ("/usr/lib/ratan-classifier", os.path.dirname(_SELF)):
+    if os.path.isdir(os.path.join(_candidate, "classifier")):
+        sys.path.insert(0, _candidate)
+        break
+
+from classifier.fsm import FsmConfig, Sample, State, WanFsm
+
+DEFAULT_CONFIG_PATH = "/etc/ratan/classifier.json"
+
+# Wire formats: must match ratan_proto.h exactly.
+RATAN_PROTO_VERSION = 1
+EVENT_HDR = "<BBH"
+EVENT_HDR_SIZE = struct.calcsize(EVENT_HDR)
+
+RATAN_EVENT_STATE  = 2
+STATE_FMT = "<QB3x16s16s32s"
+STATE_SIZE = struct.calcsize(STATE_FMT)   # 76
+
+RATAN_EVENT_WEIGHT = 3
+WEIGHT_FMT = "<QB3xI8s"
+WEIGHT_SIZE = struct.calcsize(WEIGHT_FMT) # 24
+
+# Sample event from SSE has these fields (JSON shape): kind, ts_ns, wan,
+# event, seq, rtt_us, loss, jitter_us.
+
+log = logging.getLogger("ratan-classifier")
+
+
+# ---------- config ----------
+
+DEFAULT_CONFIG = {
+    "wans": [
+        {"name": "wan0", "subflow_idx": 0, "capacity_mbps": 200, "baseline_weight": 70},
+        {"name": "wan1", "subflow_idx": 1, "capacity_mbps": 50,  "baseline_weight": 30},
+    ],
+    "fsm": {},   # any FsmConfig field; defaults used for missing keys
+    "telemetry": {
+        "stream_url": "http://127.0.0.1:9180/stream",
+        "socket_path": "/run/ratan/telemetry.sock",
+    },
+    "bpf": {
+        "map_path": "/sys/fs/bpf/ratan/path_weights",
+        "use_bpftool": True,
+    },
+}
+
+
+def load_config(path: str) -> dict:
+    if os.path.exists(path):
+        with open(path) as f:
+            user = json.load(f)
+    else:
+        user = {}
+    # shallow merge per top-level key
+    cfg = {**DEFAULT_CONFIG, **user}
+    for k in ("fsm", "telemetry", "bpf"):
+        cfg[k] = {**DEFAULT_CONFIG[k], **user.get(k, {})}
+    return cfg
+
+
+# ---------- BPF writer ----------
+
+class BpfWriter:
+    """Writes uint32 weight at uint32 key into a pinned BPF map via bpftool.
+
+    bpftool wants key/value as space-separated byte sequences. For a u32
+    LE map (which ours is), that's 4 bytes little-endian per int."""
+
+    def __init__(self, map_path: str, enabled: bool):
+        self.map_path = map_path
+        self.enabled = enabled
+        if enabled and not os.path.exists(map_path):
+            log.warning("BPF map %s not pinned yet; weight writes will "
+                        "fail silently until ratan-sched is loaded", map_path)
+
+    def _bytes_args(self, n: int) -> list:
+        return [str(b) for b in struct.pack("<I", n)]
+
+    def write(self, subflow_idx: int, weight: int) -> bool:
+        if not self.enabled:
+            return True
+        if not os.path.exists(self.map_path):
+            return False
+        cmd = [
+            "bpftool", "map", "update", "pinned", self.map_path,
+            "key", *self._bytes_args(subflow_idx),
+            "value", *self._bytes_args(max(0, min(100, weight))),
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+            if result.returncode != 0:
+                log.warning("bpftool failed: %s | %s",
+                            " ".join(cmd), result.stderr.strip())
+                return False
+            return True
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            log.warning("bpftool error: %s", e)
+            return False
+
+
+# ---------- telemetry emitter ----------
+
+class TelemetryEmitter:
+    """Writes RATAN_EVENT_STATE / WEIGHT envelopes to /run/ratan/telemetry.sock."""
+
+    def __init__(self, socket_path: str):
+        self.socket_path = socket_path
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+
+    def _send(self, kind: int, payload: bytes):
+        hdr = struct.pack(EVENT_HDR, kind, RATAN_PROTO_VERSION, len(payload))
+        try:
+            self.sock.sendto(hdr + payload, self.socket_path)
+        except OSError as e:
+            log.debug("telemetry sendto: %s (daemon down? continuing)", e)
+
+    def state(self, ts_ns: int, wan_id: int, from_s: str, to_s: str, reason: str):
+        payload = struct.pack(STATE_FMT, ts_ns, wan_id,
+                              from_s.encode()[:15],
+                              to_s.encode()[:15],
+                              reason.encode()[:31])
+        self._send(RATAN_EVENT_STATE, payload)
+
+    def weight(self, ts_ns: int, wan_id: int, weight: int, source: str):
+        payload = struct.pack(WEIGHT_FMT, ts_ns, wan_id,
+                              max(0, min(100, weight)),
+                              source.encode()[:7])
+        self._send(RATAN_EVENT_WEIGHT, payload)
+
+    def close(self):
+        self.sock.close()
+
+
+# ---------- SSE client ----------
+
+def sse_events(stream_url: str, stop_flag):
+    """Generator yielding parsed JSON events from an SSE stream. Reconnects
+    indefinitely on disconnection (with backoff)."""
+    backoff = 0.5
+    while not stop_flag():
+        try:
+            req = urllib.request.Request(stream_url,
+                                          headers={"Accept": "text/event-stream"})
+            with urllib.request.urlopen(req, timeout=None) as resp:
+                log.info("SSE connected to %s", stream_url)
+                backoff = 0.5
+                for raw in resp:
+                    if stop_flag():
+                        return
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    if not line.startswith("data: "):
+                        continue
+                    try:
+                        yield json.loads(line[6:])
+                    except json.JSONDecodeError as e:
+                        log.warning("bad SSE frame: %s", e)
+        except (urllib.error.URLError, ConnectionError, OSError) as e:
+            log.warning("SSE disconnected (%s); retrying in %.1fs", e, backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+
+# ---------- main ----------
+
+class Orchestrator:
+    def __init__(self, cfg: dict, no_bpf: bool):
+        self.cfg = cfg
+        self.stop = False
+
+        fsm_cfg = FsmConfig(**cfg["fsm"])
+        # wan_id -> WanFsm (use subflow_idx as wan_id everywhere internal)
+        self.fsms: Dict[int, WanFsm] = {}
+        self.wan_names: Dict[int, str] = {}
+        for w in cfg["wans"]:
+            idx = int(w["subflow_idx"])
+            self.fsms[idx] = WanFsm(
+                wan_id=idx,
+                capacity_mbps=float(w.get("capacity_mbps", 100)),
+                cfg=fsm_cfg,
+                baseline_weight=int(w.get("baseline_weight", fsm_cfg.baseline_weight)),
+            )
+            self.wan_names[idx] = w.get("name", f"wan{idx}")
+
+        self.tx = TelemetryEmitter(cfg["telemetry"]["socket_path"])
+        self.bpf = BpfWriter(cfg["bpf"]["map_path"],
+                              enabled=cfg["bpf"]["use_bpftool"] and not no_bpf)
+
+    def _stop_check(self) -> bool:
+        return self.stop
+
+    def request_stop(self, *_):
+        log.info("stop requested")
+        self.stop = True
+
+    def initialize_weights(self):
+        """Push the configured baseline weights at startup so the BPF map
+        reflects classifier-side state from t=0 -- otherwise the prober's
+        initial weights win until our first transition."""
+        for idx, fsm in self.fsms.items():
+            self.bpf.write(idx, fsm.weight)
+            self.tx.weight(time.monotonic_ns(), idx, fsm.weight, "predict")
+
+    def handle_sample(self, ev: dict):
+        if ev.get("kind") != "sample":
+            return
+        wan_id = ev.get("wan")
+        if wan_id not in self.fsms:
+            return
+        sample = Sample(
+            ts_ns=ev.get("ts_ns", 0),
+            wan_id=wan_id,
+            event=ev.get("event", 0),
+            rtt_us=ev.get("rtt_us", 0),
+            jitter_us=ev.get("jitter_us", 0),
+        )
+        tr = self.fsms[wan_id].on_sample(sample)
+        if tr is None:
+            return
+
+        # state change?
+        if tr.from_state != tr.to_state:
+            log.info("[%s] %s -> %s (%s) w=%d",
+                     self.wan_names[wan_id], tr.from_state.value,
+                     tr.to_state.value, tr.reason, tr.new_weight)
+            self.tx.state(tr.ts_ns, wan_id, tr.from_state.value,
+                          tr.to_state.value, tr.reason)
+        # weight change?
+        if tr.old_weight != tr.new_weight:
+            self.tx.weight(tr.ts_ns, wan_id, tr.new_weight, "predict")
+            self.bpf.write(wan_id, tr.new_weight)
+
+    def run(self):
+        signal.signal(signal.SIGINT,  self.request_stop)
+        signal.signal(signal.SIGTERM, self.request_stop)
+
+        log.info("classifier starting; %d WAN(s): %s",
+                 len(self.fsms),
+                 ", ".join(f"{n}(idx={i},w={f.baseline_weight})"
+                           for i, (n, f) in
+                           enumerate(zip(self.wan_names.values(), self.fsms.values()))))
+        self.initialize_weights()
+
+        for ev in sse_events(self.cfg["telemetry"]["stream_url"], self._stop_check):
+            self.handle_sample(ev)
+            if self.stop:
+                break
+
+        self.tx.close()
+        log.info("classifier stopped")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=DEFAULT_CONFIG_PATH)
+    ap.add_argument("--foreground", action="store_true",
+                    help="log to stderr at INFO (default on for procd)")
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--no-bpf", action="store_true",
+                    help="skip bpftool writes (dev box without the map)")
+    args = ap.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
+
+    cfg = load_config(args.config)
+    orch = Orchestrator(cfg, no_bpf=args.no_bpf)
+    orch.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

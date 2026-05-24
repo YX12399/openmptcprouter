@@ -1,0 +1,30 @@
+{
+  "_comment": "RATAN classifier config. subflow_idx must match the prober's UCI and the order in which mptcpd registers MPTCP endpoints. Verify with: ip mptcp endpoint show",
+  "wans": [
+    {"name": "starlink", "subflow_idx": 0, "capacity_mbps": 200, "baseline_weight": 70},
+    {"name": "cellular", "subflow_idx": 1, "capacity_mbps": 50,  "baseline_weight": 30}
+  ],
+  "fsm": {
+    "transient_trigger_ms": 100,
+    "transient_recover_ms": 200,
+    "transient_budget_ms": 500,
+    "degrading_rtt_factor": 2.5,
+    "degrading_loss_pct": 10.0,
+    "degrading_sustain_ms": 2000,
+    "degrading_weight_floor": 5,
+    "degrading_decay_ms": 1500,
+    "healthy_rtt_factor": 1.5,
+    "healthy_loss_pct": 1.0,
+    "healthy_sustain_ms": 3000,
+    "down_sustain_ms": 1000,
+    "down_recovery_sustain_ms": 2000
+  },
+  "telemetry": {
+    "stream_url": "http://127.0.0.1:9180/stream",
+    "socket_path": "/run/ratan/telemetry.sock"
+  },
+  "bpf": {
+    "map_path": "/sys/fs/bpf/ratan/path_weights",
+    "use_bpftool": true
+  }
+}

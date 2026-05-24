@@ -24,7 +24,7 @@ ratan/
 └── scripts/                        build wrappers                                  [STEP 10]
 ```
 
-## Current state — Step 4 COMPLETE (steps 1–4 of 17)
+## Current state — Steps 1–5 of 17 (Step 5 = the smart classifier)
 
 Shipped (Step 1, scheduler source):
 - `src/sched/ratan_sched.bpf.c` — BPF struct_ops MPTCP scheduler. Default behavior = highest weight in a pinned `ratan_path_weights` map wins; falls back to first-active subflow if weights are all zero.
@@ -100,7 +100,17 @@ Shipped (Step 4b, MOS slice — the "did the call survive?" quantification):
 
 **Verified end-to-end locally**: fed 120 prober samples on two WANs (25ms vs 60ms) + one `VideoCall/Teams` flow_start; MOS thread correctly selected the 25ms WAN, computed MOS = **4.397** (matches offline reference calculation), persisted to `mos` table, returned via `/mos` endpoint. Boundary tests confirmed MOS clamps at 4.5/1.0 across the realistic input range.
 
-### Step 4 complete. What we can do today:
+Shipped (Step 5, the smart classifier — the **heart of "smart"**):
+- `src/classifier/ewma.py` — tiny EWMA filter; standalone-unit-testable.
+- `src/classifier/fsm.py` — pure-Python per-WAN finite state machine. **No I/O.** Inputs: samples. Output: optional `Transition`. States: HEALTHY → TRANSIENT → DEGRADING → DOWN with the two-channel signal decomposition (slow baseline EWMA vs fast transient EWMA) that makes Starlink's 15s handovers look like blips, not degradation.
+- `src/classifier/tests/{test_fsm,test_ewma}.py` — **14 unit tests, all passing.** The headline regression test (`test_repeated_blips_never_decay_weight`) feeds ten back-to-back 250ms Starlink-handover blips and asserts the weight never drops from baseline. Other tests cover: short blip → TRANSIENT (not DEGRADING), short blip recovery to HEALTHY, sustained intermittent loss → DEGRADING with smooth weight decay, 1.5s blackhole → DOWN, DOWN recovery, preempter forces TRANSIENT, steady-state silence.
+- `src/classifier/ratan-classifier` — thin orchestrator (~270 lines). Long-lived SSE client to `http://127.0.0.1:9180/stream`, per-WAN `WanFsm` instances, emits `RATAN_EVENT_STATE` + `RATAN_EVENT_WEIGHT` envelopes back to the telemetry socket (symmetric with everything else), writes new weights to the pinned BPF map via `bpftool`. Auto-reconnects SSE on disconnect with exponential backoff. Has `--no-bpf` for dev boxes without the map.
+- `packaging/openwrt/ratan-classifier/` — OpenWrt package (`+python3-light +python3-urllib +bpftool +ratan-telemetry +ratan-sched`) + procd init (waits for telemetry HTTP `/healthz` before launching) + default `/etc/ratan/classifier.json` config.
+- `ratan-full` metapackage now also depends on `+ratan-classifier`.
+
+**Verified end-to-end locally**: telemetry daemon + classifier started; fed 1.25s of baseline OK samples on two WANs (25ms / 60ms), then 5 consecutive losses on WAN 0 (the Starlink-handover signature); classifier transitioned `HEALTHY → TRANSIENT (consec_loss_100ms)` then `TRANSIENT → HEALTHY (blip_ended_200ms)` 350ms later; **weight stayed at 70 the whole time**; transitions correctly persisted in the SQLite `state_transitions` table.
+
+### Step 5 complete. What we can do today:
 
 ```sh
 # build everything in src/telemetry/
@@ -111,8 +121,13 @@ cd ratan/src/telemetry && make
 mkdir -p /tmp/ratan
 ./ratan_telemetryd --db /tmp/ratan/t.db --schema ./schema.sql \
     --sock /tmp/ratan/t.sock --http-port 9180 \
-    --no-discover --no-flowtrack          # disable kernel-side bits on dev box
+    --no-discover --no-flowtrack \
     --foreground &
+
+# run the classifier against it (dev mode: skip bpftool writes)
+cd ../classifier
+python3 -m unittest classifier.tests.test_fsm classifier.tests.test_ewma -v
+./ratan-classifier --config /etc/ratan/classifier.json --no-bpf --foreground &
 
 # record a test session with synchronized markers (Step 4b/harness)
 ratan/src/test/ratan-test --port 9180 --sock /tmp/ratan/t.sock list-recipes

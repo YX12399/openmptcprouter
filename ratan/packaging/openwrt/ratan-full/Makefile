@@ -27,7 +27,8 @@ define Package/ratan-full
     +ratan-sched \
     +ratan-prober \
     +ratan-telemetry \
-    +ratan-test
+    +ratan-test \
+    +ratan-classifier
   # Future components will be added here as they ship:
   #   +ratan-classifier  (Step 5)
   #   +ratan-predictor   (Step 6)
@@ -43,7 +44,8 @@ define Package/ratan-full/description
   aggregation engine (Starlink-aware MPTCP scheduling, smart prediction,
   sub-200ms failover, QoS, telemetry, LuCI UI).
 
-  Currently includes: ratan-sched, ratan-prober, ratan-telemetry, ratan-test.
+  Currently includes: ratan-sched, ratan-prober, ratan-telemetry,
+  ratan-test, ratan-classifier.
 endef
 
 define Build/Prepare
