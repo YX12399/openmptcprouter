@@ -24,7 +24,18 @@ ratan/
 └── scripts/                        build wrappers                                  [STEP 10]
 ```
 
-## Current state — Steps 1–5, 9, 11 of 17
+## Current state — Steps 1–5, 9, 11 (design integration) of 17
+
+> **RATAN coexists with LuCI.** The standard LuCI admin (wizards, WAN/LAN
+> config, firewall, system status, syslog, backup, OpenMPTCProuter status,
+> realtime bandwidth & connections) ships unchanged and is the canonical
+> place for system administration. RATAN adds a *new* dashboard
+> specifically for our MPTCP-bonding telemetry and Starlink-handover
+> intelligence. The RATAN nav has a "LuCI ▾" dropdown in the top-right
+> that deep-links to the common LuCI destinations so users always have
+> one click back to the full admin surface.
+
+
 
 Shipped (Step 1, scheduler source):
 - `src/sched/ratan_sched.bpf.c` — BPF struct_ops MPTCP scheduler. Default behavior = highest weight in a pinned `ratan_path_weights` map wins; falls back to first-active subflow if weights are all zero.
@@ -123,18 +134,66 @@ Shipped (Step 9, handover predictor — variable 15-60s cadence):
 - Starlink LEO satellite handovers happen every **15-60 seconds** (variable per session, not fixed 15s). The FSM is cadence-agnostic; the prediction layer (Step 9) tracks inter-handover intervals over a sliding window and pre-empts only when the coefficient of variation indicates consistent cadence.
 - Compound case (minor obstruction + handover) verified by unit test `test_minor_obstruction_plus_handovers_stays_usable` and by the new `starlink_obstruction_plus_handover.yaml` recipe. FSM correctly stays HEALTHY at 2% baseline (the call-routing decision belongs to QoS layer Step 8, not the classifier).
 
-Shipped (Step 11, LuCI dashboard — the first user-visible artifact):
-- `packaging/openwrt/luci-app-ratan/` — pure-static HTML/JS dashboard served by uhttpd; no framework bloat. Pages: **Overview** (per-WAN cards with confidence tier + handover stats + 8-KPI counter strip), **Live** (auto-refreshing event-log with kind-color-coding), **Sessions** (list/create/stop/download/delete via the daemon HTTP API), **Handover** (per-WAN predictor status — confidence tier, CoV, median interval, next predicted, miss streak, armed state).
-- `root/www/cgi-bin/ratan-api` — tiny shell CGI proxy from `/cgi-bin/ratan-api/<path>` to `http://127.0.0.1:9180/<path>`. Keeps the daemon port firewall-internal. Surfaces upstream errors as JSON so the UI shows them inline (not blank screens).
-- `root/www/ratan/{overview,live,sessions,handover,index}.html` + `ratan.css` + `ratan.js` (~4500 LOC across all pages). Vanilla JS, `fetch()`, no jQuery. Pages auto-refresh on 1-5s cadences. Sessions page has working Download / Stop / Delete / Start-new buttons.
-- `root/usr/share/luci/menu.d/luci-app-ratan.json` — adds menu entries under **Network → RATAN → {Overview, Live, Sessions, Handover}**.
-- `root/usr/share/rpcd/acl.d/luci-app-ratan.json` — grants the read permissions.
-- Postinst symlinks `/run/ratan` to `/www/ratan-data` so the static pages can `fetch('/ratan-data/handover-status.json')` without a CGI roundtrip.
-- `ratan-full` metapackage now depends on `+luci-app-ratan`.
+Shipped (Step 11, LuCI dashboard — design integration):
 
-**Verified locally**: all 7 files (4 HTML + index + CSS + JS) serve 200; CGI-style proxy to `/metrics` and `/healthz` works.
+The first cut shipped my hand-rolled HTML/CSS/JS. This commit **replaces it
+wholesale with the polished design** delivered by the design-prompt pass
+(dark theme, Geist Mono numbers, color-coded state tiers, inline SVG
+sparklines, six page templates: Overview / Live / Sessions / Handover /
+Flows / Devices). The design's mock-data simulator was rewritten as a
+real-data adapter so the same pages work against live backends with no
+template changes.
 
-**Live SSE proxy is intentionally deferred** — shell CGI buffers; the Live page polls instead. Future commit adds uhttpd url-rewrite for true SSE OR a small socat helper.
+- `packaging/openwrt/luci-app-ratan/root/www/ratan/`:
+  - `ratan.css` (~20 KB) — full design system: layered surfaces, semantic
+    state colors, monospace numerics, status pills, sparkline styling,
+    LuCI dropdown.
+  - `ratan.js` (~21 KB) — **real-data adapter**, same `window.RATAN`
+    public API the design's mock used (`bus`, `STATE`, `fmt`,
+    `highlightJSON`, `sparkline`, `mountNav`) plus a new `api`
+    namespace (`startSession`, `stopSession`, `deleteSession`,
+    `downloadSessionUrl`, `getSession`). Drives STATE from polling
+    seven backend endpoints at staggered cadences (`/metrics` 1s,
+    `/wans` 1s, `/handover-status.json` 1s, `/events?since=` 1s,
+    `/flows` 3s, `/discovery` 5s, `/sessions` 5s). SSE remains
+    deferred (shell CGI buffers); polling drives the bus with the
+    same event shapes the design expects.
+  - 6 HTML pages from the design (overview/live/sessions/handover/flows/devices)
+    + `index.html` redirect.
+  - `cgi-bin/ratan-api` — unchanged proxy from the earlier commit.
+- Two new backend endpoints in the telemetry daemon:
+  - **`GET /wans`** — per-WAN snapshot derived from the most recent
+    samples (60s avg RTT / jitter / loss %), last state transition,
+    last weight write. Single SQL roundtrip per WAN.
+  - **`GET /events?since=<ts_ns>&kind=<k>&limit=<N>`** — recent events
+    of mixed kinds (sample/state/weight/flow/discovery/mos) for the
+    Live page's catch-up polling. Sorted by ts_ns. Used until we wire
+    real SSE.
+- LuCI menu entries added for Flows + Devices (under Network → RATAN).
+- **`LuCI ▾` dropdown in the RATAN top nav** with deep-links to: LuCI home,
+  OMR status, Setup wizard, WAN/LAN config, Firewall, Realtime bandwidth,
+  Realtime connections, System log, Backup/flash. Makes it explicit that
+  RATAN is a dashboard, not a replacement.
+- The earlier "Step 11b — LuCI-parity pages" plan is **cancelled**.
+  The whole LuCI app set ships unchanged; users go there for anything
+  outside RATAN's specific telemetry scope.
+
+**End-to-end verified locally**: 6 HTML pages + CSS + JS serve 200; `/wans`
+returns coherent per-WAN snapshot; `/events?since=0` returns mixed-kind
+recent timeline; `/handover-status.json` reaches the static path; session
+create/stop/delete round-trip through `api.*`.
+
+**Known display gaps** (carry-forward, not commit-blocking):
+- **Per-WAN throughput chart** on the Overview page renders empty until
+  we add a `/wan-stats` endpoint that reads
+  `/sys/class/net/<iface>/statistics/{rx_bytes,tx_bytes}` (and maps
+  subflow_idx → iface from `/etc/config/ratan-prober`).
+- **Per-flow byte counters** are 0 in the Flows table because the
+  `flows` SQLite table doesn't yet persist the byte counters that
+  arrive on the wire (a Step 4b loose end).
+- **Real SSE** still deferred behind shell-CGI's buffering; the Live
+  page polls `/events?since=` instead. Public API doesn't change when
+  SSE eventually lands.
 
 ### Step 11 complete. What we can do today:
 

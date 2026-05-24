@@ -29,5 +29,15 @@
 		"title": "Handover",
 		"order": 4,
 		"action": { "type": "view", "path": "ratan/handover" }
+	},
+	"admin/network/ratan/flows": {
+		"title": "Flows",
+		"order": 5,
+		"action": { "type": "view", "path": "ratan/flows" }
+	},
+	"admin/network/ratan/devices": {
+		"title": "Devices",
+		"order": 6,
+		"action": { "type": "view", "path": "ratan/devices" }
 	}
 }

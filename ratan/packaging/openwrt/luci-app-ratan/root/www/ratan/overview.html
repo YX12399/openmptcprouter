@@ -1,110 +1,307 @@
 <!DOCTYPE html>
-<!-- SPDX-License-Identifier: GPL-2.0 -->
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>RATAN · Overview</title>
-<link rel="stylesheet" href="ratan.css">
+  <meta charset="UTF-8" />
+  <title>RATAN · Overview</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="ratan.css" />
 </head>
 <body>
-<main>
-    <div id="kpis"><span class="muted">loading...</span></div>
-    <h2 style="margin-top:24px">Per-WAN status</h2>
-    <div class="cards" id="wan-cards"><div class="empty">loading…</div></div>
-    <h2 style="margin-top:24px">Last 10 state transitions</h2>
-    <div id="transitions"></div>
-</main>
-<script src="ratan.js"></script>
-<script>
-renderHeader("overview");
+  <div id="nav-slot" data-screen-label="01 Overview"></div>
 
-const PARSE_PROM = (text) => {
-    /* Quick-and-dirty Prometheus text parser: returns {metric: value}. */
-    const out = {};
-    for (const line of text.split("\n")) {
-        if (line.startsWith("#") || !line.trim()) continue;
-        const space = line.lastIndexOf(" ");
-        if (space < 0) continue;
-        const name = line.slice(0, space).trim().replace(/\{.*\}/, "");
-        const val = parseFloat(line.slice(space + 1));
-        if (!isNaN(val)) out[name] = val;
+  <main class="page">
+    <header class="page-head">
+      <div>
+        <div class="page-title">Overview</div>
+        <div class="page-sub">router · openwrt · uhttpd@127.0.0.1:9180 · stream open</div>
+      </div>
+      <div class="page-head-actions">
+        <label class="switch">
+          <input type="checkbox" id="live-toggle" checked />
+          <span class="switch-track"></span>
+          <span>live</span>
+        </label>
+        <button class="btn" id="snapshot-btn">Snapshot</button>
+        <button class="btn primary" id="new-session-btn">+ New session</button>
+      </div>
+    </header>
+
+    <div class="rationale">
+      <b>Design notes.</b>
+      Single-column dense readout. KPI strip pinned at top (the demo-glance row). Per-WAN cards in a 2-up grid
+      below — each is a self-contained health card with a state badge, a 60-second RTT sparkline, the current
+      weight as a meter, and the handover predictor's confidence tier on the right. Big stacked-area throughput
+      chart at the bottom is the only chart on the page; everything else is mono numbers + hairline borders.
+      Color is reserved for state (green / blue / amber / red) and is never decorative.
+    </div>
+
+    <!-- KPI strip ---------------------------------------------------------- -->
+    <section class="kpi-strip" id="kpi-strip">
+      <div class="kpi"><div class="kpi-label">samples</div><div class="kpi-value" data-k="samples_total">—</div><div class="kpi-delta" data-d="samples_total">/s</div></div>
+      <div class="kpi"><div class="kpi-label">losses</div><div class="kpi-value" data-k="samples_loss">—</div><div class="kpi-delta">cumulative</div></div>
+      <div class="kpi"><div class="kpi-label">failovers</div><div class="kpi-value" data-k="samples_failover">—</div><div class="kpi-delta">fast path</div></div>
+      <div class="kpi"><div class="kpi-label">state changes</div><div class="kpi-value" data-k="state_transitions">—</div><div class="kpi-delta">all wans</div></div>
+      <div class="kpi"><div class="kpi-label">flow events</div><div class="kpi-value" data-k="flow_events">—</div><div class="kpi-delta">ndpi</div></div>
+      <div class="kpi"><div class="kpi-label">mos samples</div><div class="kpi-value" data-k="mos_events">—</div><div class="kpi-delta">videocall</div></div>
+      <div class="kpi"><div class="kpi-label">active sessions</div><div class="kpi-value" data-k="active_sessions">—</div><div class="kpi-delta">recording</div></div>
+      <div class="kpi"><div class="kpi-label">sse subs</div><div class="kpi-value" data-k="sse_clients">—</div><div class="kpi-delta">/stream</div></div>
+    </section>
+
+    <!-- WAN cards ---------------------------------------------------------- -->
+    <section class="grid-2 stack-12" style="margin-bottom: 16px;">
+      <div class="card wan-card" data-wan="0">
+        <div class="card-head">
+          <div>
+            <div class="card-title">
+              Starlink
+              <span class="card-title-sub">wan_starlink · LEO</span>
+            </div>
+            <div class="wan-card-meta" style="margin-top:4px;">
+              <span class="iface">169.254.10.1</span><span>·</span>
+              <span>mtu 1420</span><span>·</span>
+              <span>asn AS14593</span>
+            </div>
+          </div>
+          <div class="badge healthy" data-state>HEALTHY</div>
+        </div>
+        <div class="card-body">
+          <div class="wan-weight-row">
+            <span>weight · MPTCP scheduler share</span>
+            <span class="num"><span data-weight>70</span> / 100</span>
+          </div>
+          <div class="weight-meter" style="margin-bottom: 16px;"><div class="weight-meter-fill" data-weight-fill style="width:70%"></div></div>
+
+          <div class="metric-grid" style="margin-bottom: 16px;">
+            <div class="metric"><div class="metric-label">rtt</div><div class="metric-value"><span data-rtt>25.0</span><span class="unit">ms</span></div></div>
+            <div class="metric"><div class="metric-label">jitter</div><div class="metric-value"><span data-jit>0.5</span><span class="unit">ms</span></div></div>
+            <div class="metric"><div class="metric-label">loss</div><div class="metric-value"><span data-loss>0.00</span><span class="unit">%</span></div></div>
+            <div class="metric"><div class="metric-label">throughput</div><div class="metric-value"><span data-thr>18.4</span><span class="unit">Mbps</span></div></div>
+          </div>
+
+          <div style="display:flex; justify-content:space-between; align-items:flex-end; gap:12px; margin-bottom:6px;">
+            <div class="metric-label">rtt · last 60s</div>
+            <div style="font-family: var(--mono); font-size: 10px; color: var(--fg-3);">
+              <span data-rtt-min>22.1</span>ms · <span data-rtt-max>28.4</span>ms
+            </div>
+          </div>
+          <div data-spark style="border:1px solid var(--line); border-radius: var(--r-sm); background: var(--bg-1); padding: 6px 8px;"></div>
+
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-top:16px; padding-top:14px; border-top: 1px solid var(--line);">
+            <div>
+              <div class="metric-label" style="margin-bottom:4px;">handover predictor</div>
+              <div style="font-family: var(--mono); font-size: 11px; color: var(--fg-2);">
+                next in <span style="color:var(--fg);" data-next>4.3</span>s · median <span data-median>15.3</span>s · CoV <span data-cov>0.18</span>
+              </div>
+            </div>
+            <div class="badge tight" data-conf>tight</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card wan-card" data-wan="1">
+        <div class="card-head">
+          <div>
+            <div class="card-title">
+              Cellular
+              <span class="card-title-sub">wan_lte · band 71</span>
+            </div>
+            <div class="wan-card-meta" style="margin-top:4px;">
+              <span class="iface">10.122.45.211</span><span>·</span>
+              <span>mtu 1500</span><span>·</span>
+              <span>asn AS21928</span>
+            </div>
+          </div>
+          <div class="badge healthy" data-state>HEALTHY</div>
+        </div>
+        <div class="card-body">
+          <div class="wan-weight-row">
+            <span>weight · MPTCP scheduler share</span>
+            <span class="num"><span data-weight>30</span> / 100</span>
+          </div>
+          <div class="weight-meter" style="margin-bottom: 16px;"><div class="weight-meter-fill" data-weight-fill style="width:30%; background: #b78aff;"></div></div>
+
+          <div class="metric-grid" style="margin-bottom: 16px;">
+            <div class="metric"><div class="metric-label">rtt</div><div class="metric-value"><span data-rtt>42.0</span><span class="unit">ms</span></div></div>
+            <div class="metric"><div class="metric-label">jitter</div><div class="metric-value"><span data-jit>1.2</span><span class="unit">ms</span></div></div>
+            <div class="metric"><div class="metric-label">loss</div><div class="metric-value"><span data-loss>0.10</span><span class="unit">%</span></div></div>
+            <div class="metric"><div class="metric-label">throughput</div><div class="metric-value"><span data-thr>6.2</span><span class="unit">Mbps</span></div></div>
+          </div>
+
+          <div style="display:flex; justify-content:space-between; align-items:flex-end; gap:12px; margin-bottom:6px;">
+            <div class="metric-label">rtt · last 60s</div>
+            <div style="font-family: var(--mono); font-size: 10px; color: var(--fg-3);">
+              <span data-rtt-min>38.4</span>ms · <span data-rtt-max>46.2</span>ms
+            </div>
+          </div>
+          <div data-spark style="border:1px solid var(--line); border-radius: var(--r-sm); background: var(--bg-1); padding: 6px 8px;"></div>
+
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-top:16px; padding-top:14px; border-top: 1px solid var(--line);">
+            <div>
+              <div class="metric-label" style="margin-bottom:4px;">handover predictor</div>
+              <div style="font-family: var(--mono); font-size: 11px; color: var(--fg-2);">
+                terrestrial · no handover cycle expected
+              </div>
+            </div>
+            <div class="badge cold" data-conf>cold</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Throughput chart --------------------------------------------------- -->
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">
+            Aggregate throughput
+            <span class="card-title-sub">stacked · bytes/sec per WAN · last 90s</span>
+          </div>
+        </div>
+        <div class="card-actions" style="font-family:var(--mono); font-size:11px; color:var(--fg-2);">
+          <span style="display:inline-flex; align-items:center; gap:5px;"><span style="width:8px;height:8px;background:var(--accent);display:inline-block;border-radius:2px;"></span> wan_starlink</span>
+          <span style="display:inline-flex; align-items:center; gap:5px; margin-left:12px;"><span style="width:8px;height:8px;background:#b78aff;display:inline-block;border-radius:2px;"></span> wan_lte</span>
+          <span style="margin-left:16px;">aggregate <b style="color:var(--fg);" id="agg-total">24.6 Mbps</b></span>
+        </div>
+      </div>
+      <div class="card-body" style="height: 280px;">
+        <canvas id="throughput-chart"></canvas>
+      </div>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="ratan.js"></script>
+  <script>
+    RATAN.mountNav('overview');
+    const { bus, STATE, fmt, sparkline } = RATAN;
+
+    // ---- KPI strip ------
+    const kpiEls = {};
+    document.querySelectorAll('#kpi-strip [data-k]').forEach(el => kpiEls[el.dataset.k] = el);
+    let prevSamples = STATE.counters.samples_total;
+    function renderKPIs() {
+      kpiEls.samples_total.textContent = fmt.int(STATE.counters.samples_total);
+      kpiEls.samples_loss.textContent  = fmt.int(STATE.counters.samples_loss);
+      kpiEls.samples_failover.textContent = fmt.int(STATE.counters.samples_failover);
+      kpiEls.state_transitions.textContent = fmt.int(STATE.counters.state_transitions);
+      kpiEls.flow_events.textContent  = fmt.int(STATE.counters.flow_events);
+      kpiEls.mos_events.textContent   = fmt.int(STATE.counters.mos_events);
+      kpiEls.active_sessions.textContent = STATE.sessions.filter(s => s.status === 'recording').length;
+      kpiEls.sse_clients.textContent  = STATE.counters.sse_clients;
+      const delta = STATE.counters.samples_total - prevSamples;
+      prevSamples = STATE.counters.samples_total;
+      document.querySelector('.kpi-delta[data-d="samples_total"]').textContent = `+${delta * 2}/s`;
     }
-    return out;
-};
+    renderKPIs();
 
-async function refresh() {
-    try {
-        // Metrics counters
-        const mRaw = await fetch("/cgi-bin/ratan-api/metrics",
-                                  { cache: "no-store" }).then(r => r.text());
-        const m = PARSE_PROM(mRaw);
-        document.getElementById("kpis").innerHTML = `
-            <span class="kpi"><div class="v">${m.ratan_samples_total || 0}</div><div class="l">samples</div></span>
-            <span class="kpi"><div class="v">${m.ratan_samples_loss || 0}</div><div class="l">losses</div></span>
-            <span class="kpi"><div class="v">${m.ratan_samples_failover || 0}</div><div class="l">fast failovers</div></span>
-            <span class="kpi"><div class="v">${m.ratan_state_transitions_total || 0}</div><div class="l">state transitions</div></span>
-            <span class="kpi"><div class="v">${m.ratan_flow_events_total || 0}</div><div class="l">flow events</div></span>
-            <span class="kpi"><div class="v">${m.ratan_mos_events_total || 0}</div><div class="l">MOS samples</div></span>
-            <span class="kpi"><div class="v">${m.ratan_sessions_started_total || 0}</div><div class="l">sessions started</div></span>
-            <span class="kpi"><div class="v">${m.ratan_sse_clients || 0}</div><div class="l">live subscribers</div></span>
-        `;
+    // ---- WAN cards ------
+    function renderWANs() {
+      document.querySelectorAll('.wan-card').forEach(card => {
+        const i = parseInt(card.dataset.wan, 10);
+        const w = STATE.wans[i];
+        card.querySelector('[data-state]').textContent = w.state;
+        card.querySelector('[data-state]').className = 'badge ' + w.state.toLowerCase();
+        card.querySelector('[data-weight]').textContent = w.weight;
+        card.querySelector('[data-weight-fill]').style.width = w.weight + '%';
+        card.querySelector('[data-rtt]').textContent = fmt.us(w.rtt_us);
+        card.querySelector('[data-jit]').textContent = fmt.us(w.jitter_us);
+        card.querySelector('[data-loss]').textContent = w.loss.toFixed(2);
+        card.querySelector('[data-thr]').textContent = (w.bps * 8 / 1e6).toFixed(1);
+        const sp = card.querySelector('[data-spark]');
+        sp.innerHTML = sparkline(w.rttHist, { w: 600, h: 40 });
+        card.querySelector('[data-rtt-min]').textContent = (Math.min(...w.rttHist)/1000).toFixed(1);
+        card.querySelector('[data-rtt-max]').textContent = (Math.max(...w.rttHist)/1000).toFixed(1);
 
-        // Per-WAN composite from handover-status + recent state transitions.
-        const [ho, txns] = await Promise.all([
-            fetchHandoverStatus(),
-            apiGet("/sessions").then(async d => {
-                /* If we don't have a /state_transitions list endpoint yet,
-                 * we can derive what we need from session downloads -- but
-                 * for the overview we just need recent ones globally.
-                 * Use a small inline query via /sessions/latest hack: skip. */
-                return null;
-            }).catch(() => null),
-        ]);
-
-        const wans = (ho && ho.wans) || [];
-        if (wans.length === 0) {
-            document.getElementById("wan-cards").innerHTML =
-                `<div class="empty">No WAN data yet. Is the classifier running?<br>
-                 <span class="mono">/etc/init.d/ratan-classifier start</span></div>`;
-        } else {
-            document.getElementById("wan-cards").innerHTML = wans.map(w => `
-                <div class="card">
-                    <h3>WAN ${w.wan_id}
-                        <span class="confidence ${w.confidence}">${w.confidence}</span>
-                    </h3>
-                    <div class="row"><span class="label">Handover events seen</span>
-                                     <span class="val">${w.events_total}</span></div>
-                    <div class="row"><span class="label">Intervals tracked</span>
-                                     <span class="val">${w.intervals_tracked}</span></div>
-                    <div class="row"><span class="label">CoV (variance)</span>
-                                     <span class="val">${w.cov === null ? '—' : w.cov.toFixed(3)}</span></div>
-                    <div class="row"><span class="label">Median interval</span>
-                                     <span class="val">${w.median_interval_s === null ? '—' : w.median_interval_s.toFixed(1) + 's'}</span></div>
-                    <div class="row"><span class="label">Next predicted</span>
-                                     <span class="val">${w.next_predicted_in_s === null ? '—' : fmtDuration(w.next_predicted_in_s)}</span></div>
-                    <div class="row"><span class="label">Miss streak</span>
-                                     <span class="val">${w.miss_streak}</span></div>
-                    <div class="row"><span class="label">Currently armed</span>
-                                     <span class="val">${w.currently_armed ? '<span style="color:var(--warn)">yes</span>' : 'no'}</span></div>
-                </div>
-            `).join("");
+        if (i === 0) {
+          card.querySelector('[data-next]').textContent = w.handover.next_predicted_in_s.toFixed(1);
+          card.querySelector('[data-median]').textContent = w.handover.median_interval_s.toFixed(1);
+          card.querySelector('[data-cov]').textContent  = w.handover.cov.toFixed(2);
+          const conf = card.querySelector('[data-conf]');
+          conf.textContent = w.handover.confidence;
+          conf.className = 'badge ' + w.handover.confidence;
         }
-
-        // Recent transitions: we don't yet have an /events query endpoint,
-        // so this section stays empty for now. Could be added by querying
-        // the daemon's most recent session if one is active. For now,
-        // direct users to the Live page.
-        document.getElementById("transitions").innerHTML =
-            `<div class="muted">See <a href="live.html">Live</a> for the realtime event stream.</div>`;
-
-    } catch (e) {
-        showError("kpis", e);
+      });
     }
-}
+    renderWANs();
 
-refresh();
-setInterval(refresh, 2000);
-</script>
+    // ---- chart ------
+    const ctx = document.getElementById('throughput-chart');
+    const N = 90;
+    const initData = STATE.wans.map(w => Array(N).fill(0).map((_,i) => (w.bpsHist[w.bpsHist.length-N+i] || w.bps) / 1e6));
+    const colors = ['#5b9dff', '#b78aff'];
+    const chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: Array(N).fill('').map((_,i) => `-${N-i}s`),
+        datasets: STATE.wans.map((w, i) => ({
+          label: w.iface,
+          data: initData[i],
+          borderColor: colors[i],
+          backgroundColor: colors[i] + '33',
+          fill: true,
+          tension: 0.3,
+          pointRadius: 0,
+          borderWidth: 1.4,
+        })),
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: '#16181d', borderColor: '#262931', borderWidth: 1,
+            titleColor: '#e8eaee', bodyColor: '#b6bac2',
+            titleFont: { family: 'Geist Mono', size: 11 },
+            bodyFont:  { family: 'Geist Mono', size: 11 },
+            padding: 8, displayColors: true, boxWidth: 8, boxHeight: 8,
+            callbacks: { label: (c) => ` ${c.dataset.label}: ${c.parsed.y.toFixed(1)} Mbps` },
+          },
+        },
+        scales: {
+          x: {
+            grid: { color: 'rgba(255,255,255,0.03)', drawTicks: false },
+            border: { display: false },
+            ticks: { color: '#5a5e68', font: { family: 'Geist Mono', size: 10 }, maxTicksLimit: 6, maxRotation: 0 },
+          },
+          y: {
+            stacked: true,
+            grid: { color: 'rgba(255,255,255,0.05)', drawTicks: false },
+            border: { display: false },
+            ticks: { color: '#5a5e68', font: { family: 'Geist Mono', size: 10 }, callback: (v) => v + ' Mbps' },
+            beginAtZero: true,
+          },
+        },
+        elements: { line: { borderJoinStyle: 'round' } },
+      },
+    });
+    function pushChart() {
+      STATE.wans.forEach((w, i) => {
+        const ds = chart.data.datasets[i];
+        ds.data.push(w.bps * 8 / 1e6);
+        ds.data.shift();
+      });
+      const total = STATE.wans.reduce((s, w) => s + w.bps * 8 / 1e6, 0);
+      document.getElementById('agg-total').textContent = total.toFixed(1) + ' Mbps';
+      chart.update('none');
+    }
+
+    // ---- live wiring ------
+    let live = true;
+    document.getElementById('live-toggle').addEventListener('change', e => live = e.target.checked);
+    bus.on('tick', () => {
+      if (!live) return;
+      renderKPIs();
+      renderWANs();
+      pushChart();
+    });
+
+    // simple new-session button just bumps counter
+    document.getElementById('new-session-btn').addEventListener('click', () => {
+      window.location.href = 'sessions.html?new=1';
+    });
+  </script>
 </body>
 </html>

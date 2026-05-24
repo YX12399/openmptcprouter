@@ -1133,6 +1133,240 @@ static void route_flows_list(int fd, int limit)
 	free(out);
 }
 
+/* GET /wans -- per-WAN snapshot derived from recent samples + last
+ * state-transition + last weight. The UI's STATE.wans[i] is populated
+ * from this; one poll per second is plenty (data only changes when a
+ * sample lands, which itself is throttled by the prober). */
+static void route_wans_snapshot(int fd)
+{
+	sqlite3_stmt *st;
+	const char *q;
+	char *out = malloc(32768);
+	if (!out) { send_status(fd, 500, "text/plain", "", 0); return; }
+	size_t len = 0;
+
+	/* Distinct WAN ids seen in the last 5 minutes */
+	q = "SELECT DISTINCT wan_id FROM samples WHERE ts_ns > ? ORDER BY wan_id";
+	if (sqlite3_prepare_v2(g_db, q, -1, &st, NULL) != SQLITE_OK) {
+		free(out); send_status(fd, 500, "text/plain", "", 0); return;
+	}
+	sqlite3_int64 cutoff_5m = (sqlite3_int64)now_ns() -
+		(sqlite3_int64)300 * 1000000000;
+	if (cutoff_5m < 0) cutoff_5m = 0;
+	sqlite3_bind_int64(st, 1, cutoff_5m);
+
+	len += snprintf(out + len, 32768 - len, "{\"wans\":[");
+	bool first = true;
+	while (sqlite3_step(st) == SQLITE_ROW) {
+		int wan_id = sqlite3_column_int(st, 0);
+		if (!first) len += snprintf(out + len, 32768 - len, ",");
+		first = false;
+
+		/* Aggregate last-60s for this WAN */
+		sqlite3_stmt *sa;
+		double rtt_us_avg = 0, jitter_us_avg = 0, loss_pct = 0;
+		int    n_samples = 0;
+		sqlite3_int64 last_sample_ts = 0;
+		const char *qa =
+			"SELECT COUNT(*), AVG(NULLIF(rtt_us,0)), AVG(jitter_us), "
+			"  100.0*SUM(CASE WHEN event IN (1,2) THEN 1 ELSE 0 END) "
+			"  / COUNT(*), MAX(ts_ns) "
+			"FROM samples WHERE wan_id=? AND ts_ns > ?";
+		if (sqlite3_prepare_v2(g_db, qa, -1, &sa, NULL) == SQLITE_OK) {
+			sqlite3_bind_int(sa, 1, wan_id);
+			sqlite3_bind_int64(sa, 2,
+				(sqlite3_int64)now_ns() - 60LL * 1000000000);
+			if (sqlite3_step(sa) == SQLITE_ROW) {
+				n_samples = sqlite3_column_int(sa, 0);
+				rtt_us_avg = sqlite3_column_double(sa, 1);
+				jitter_us_avg = sqlite3_column_double(sa, 2);
+				loss_pct = sqlite3_column_double(sa, 3);
+				last_sample_ts = sqlite3_column_int64(sa, 4);
+			}
+			sqlite3_finalize(sa);
+		}
+
+		/* Last state transition for this WAN */
+		char state_str[16] = "HEALTHY";
+		sqlite3_int64 last_state_ts = 0;
+		const char *qs = "SELECT to_state, ts_ns FROM state_transitions "
+				 "WHERE wan_id=? ORDER BY ts_ns DESC LIMIT 1";
+		if (sqlite3_prepare_v2(g_db, qs, -1, &sa, NULL) == SQLITE_OK) {
+			sqlite3_bind_int(sa, 1, wan_id);
+			if (sqlite3_step(sa) == SQLITE_ROW) {
+				const unsigned char *ts = sqlite3_column_text(sa, 0);
+				if (ts) {
+					strncpy(state_str, (const char *)ts,
+					        sizeof(state_str) - 1);
+					state_str[sizeof(state_str) - 1] = '\0';
+				}
+				last_state_ts = sqlite3_column_int64(sa, 1);
+			}
+			sqlite3_finalize(sa);
+		}
+
+		/* Last weight for this WAN */
+		int weight = -1;
+		char weight_src[16] = "";
+		sqlite3_int64 last_weight_ts = 0;
+		const char *qw = "SELECT weight, source, ts_ns FROM weights "
+				 "WHERE wan_id=? ORDER BY ts_ns DESC LIMIT 1";
+		if (sqlite3_prepare_v2(g_db, qw, -1, &sa, NULL) == SQLITE_OK) {
+			sqlite3_bind_int(sa, 1, wan_id);
+			if (sqlite3_step(sa) == SQLITE_ROW) {
+				weight = sqlite3_column_int(sa, 0);
+				const unsigned char *src = sqlite3_column_text(sa, 1);
+				if (src) {
+					strncpy(weight_src, (const char *)src,
+					        sizeof(weight_src) - 1);
+					weight_src[sizeof(weight_src) - 1] = '\0';
+				}
+				last_weight_ts = sqlite3_column_int64(sa, 2);
+			}
+			sqlite3_finalize(sa);
+		}
+
+		char esc_state[24], esc_src[24];
+		json_escape(esc_state, sizeof(esc_state), state_str);
+		json_escape(esc_src,   sizeof(esc_src),   weight_src);
+
+		len += snprintf(out + len, 32768 - len,
+			"{\"wan_id\":%d,\"state\":\"%s\",\"weight\":%d,"
+			"\"rtt_us\":%.0f,\"jitter_us\":%.0f,\"loss_pct\":%.3f,"
+			"\"samples_60s\":%d,\"last_sample_ts_ns\":%lld,"
+			"\"last_state_ts_ns\":%lld,"
+			"\"last_weight_ts_ns\":%lld,\"weight_source\":\"%s\"}",
+			wan_id, esc_state, weight,
+			rtt_us_avg, jitter_us_avg, loss_pct, n_samples,
+			(long long)last_sample_ts, (long long)last_state_ts,
+			(long long)last_weight_ts, esc_src);
+	}
+	sqlite3_finalize(st);
+	len += snprintf(out + len, 32768 - len, "]}");
+	send_status(fd, 200, "application/json", out, len);
+	free(out);
+}
+
+/* GET /events?since=<ts_ns>&kind=<k>&limit=<N> -- recent events for
+ * the live page's catch-up polling (since we don't proxy SSE today).
+ * Mixed kinds returned in a single envelope-sorted timeline. */
+static void route_events_recent(int fd, int64_t since_ns, const char *kind_filter, int limit)
+{
+	if (limit <= 0 || limit > 500) limit = 100;
+	char *out = malloc(65536);
+	if (!out) { send_status(fd, 500, "text/plain", "", 0); return; }
+	size_t len = 0;
+	len += snprintf(out + len, 65536 - len, "{\"events\":[");
+	bool first = true;
+
+	struct { const char *tbl, *kind, *cols, *fmt_extra; } sources[] = {
+		{ "samples",
+		  "sample",
+		  "ts_ns,wan_id,event,seq,rtt_us,loss_count,jitter_us",
+		  NULL },
+		{ "state_transitions",
+		  "state",
+		  "ts_ns,wan_id,from_state,to_state,reason",
+		  NULL },
+		{ "weights",
+		  "weight",
+		  "ts_ns,wan_id,weight,source",
+		  NULL },
+		{ "flows",
+		  "flow",
+		  "ts_ns,event,five_tuple,category,mark",
+		  NULL },
+		{ "discovery",
+		  "discovery",
+		  "ts_ns,kind,detail",
+		  NULL },
+		{ "mos",
+		  "mos",
+		  "ts_ns,flow_id,mos,rtt_ms,loss_pct,jitter_ms",
+		  NULL },
+	};
+	for (size_t s = 0; s < sizeof(sources)/sizeof(*sources); s++) {
+		if (kind_filter && *kind_filter && strcmp(kind_filter, sources[s].kind) != 0)
+			continue;
+		char q[256];
+		snprintf(q, sizeof(q),
+			"SELECT %s FROM %s WHERE ts_ns > ? ORDER BY ts_ns DESC LIMIT ?",
+			sources[s].cols, sources[s].tbl);
+		sqlite3_stmt *st;
+		if (sqlite3_prepare_v2(g_db, q, -1, &st, NULL) != SQLITE_OK) continue;
+		sqlite3_bind_int64(st, 1, (sqlite3_int64)since_ns);
+		sqlite3_bind_int(st, 2, limit);
+
+		while (sqlite3_step(st) == SQLITE_ROW) {
+			if (65536 - len < 512) break;
+			if (!first) len += snprintf(out + len, 65536 - len, ",");
+			first = false;
+			sqlite3_int64 ts = sqlite3_column_int64(st, 0);
+			const char *k = sources[s].kind;
+			if (!strcmp(k, "sample")) {
+				len += snprintf(out + len, 65536 - len,
+					"{\"kind\":\"sample\",\"ts_ns\":%lld,\"wan\":%d,"
+					"\"event\":%d,\"seq\":%d,\"rtt_us\":%d,\"loss\":%d,"
+					"\"jitter_us\":%d}",
+					(long long)ts, sqlite3_column_int(st,1),
+					sqlite3_column_int(st,2), sqlite3_column_int(st,3),
+					sqlite3_column_int(st,4), sqlite3_column_int(st,5),
+					sqlite3_column_int(st,6));
+			} else if (!strcmp(k, "state")) {
+				char fs[24], tos[24], rs[80];
+				json_escape(fs,  sizeof(fs),  (const char *)sqlite3_column_text(st,2));
+				json_escape(tos, sizeof(tos), (const char *)sqlite3_column_text(st,3));
+				json_escape(rs,  sizeof(rs),  (const char *)sqlite3_column_text(st,4));
+				len += snprintf(out + len, 65536 - len,
+					"{\"kind\":\"state\",\"ts_ns\":%lld,\"wan\":%d,"
+					"\"from\":\"%s\",\"to\":\"%s\",\"reason\":\"%s\"}",
+					(long long)ts, sqlite3_column_int(st,1), fs, tos, rs);
+			} else if (!strcmp(k, "weight")) {
+				char src[24];
+				json_escape(src, sizeof(src), (const char *)sqlite3_column_text(st,3));
+				len += snprintf(out + len, 65536 - len,
+					"{\"kind\":\"weight\",\"ts_ns\":%lld,\"wan\":%d,"
+					"\"weight\":%d,\"source\":\"%s\"}",
+					(long long)ts, sqlite3_column_int(st,1),
+					sqlite3_column_int(st,2), src);
+			} else if (!strcmp(k, "flow")) {
+				char ev[24], ft[160], cat[80];
+				json_escape(ev,  sizeof(ev),  (const char *)sqlite3_column_text(st,1));
+				json_escape(ft,  sizeof(ft),  (const char *)sqlite3_column_text(st,2));
+				json_escape(cat, sizeof(cat), (const char *)sqlite3_column_text(st,3));
+				len += snprintf(out + len, 65536 - len,
+					"{\"kind\":\"flow\",\"ts_ns\":%lld,\"event\":\"%s\","
+					"\"five_tuple\":\"%s\",\"category\":\"%s\",\"mark\":%d}",
+					(long long)ts, ev, ft, cat, sqlite3_column_int(st,4));
+			} else if (!strcmp(k, "discovery")) {
+				char dk[48], det[200];
+				json_escape(dk,  sizeof(dk),  (const char *)sqlite3_column_text(st,1));
+				json_escape(det, sizeof(det), (const char *)sqlite3_column_text(st,2));
+				len += snprintf(out + len, 65536 - len,
+					"{\"kind\":\"discovery\",\"ts_ns\":%lld,\"sub\":\"%s\","
+					"\"detail\":\"%s\"}",
+					(long long)ts, dk, det);
+			} else if (!strcmp(k, "mos")) {
+				char fid[160];
+				json_escape(fid, sizeof(fid), (const char *)sqlite3_column_text(st,1));
+				len += snprintf(out + len, 65536 - len,
+					"{\"kind\":\"mos\",\"ts_ns\":%lld,\"flow\":\"%s\","
+					"\"mos\":%.3f,\"rtt_ms\":%.2f,\"loss_pct\":%.4f,"
+					"\"jitter_ms\":%.2f}",
+					(long long)ts, fid,
+					sqlite3_column_double(st,2),
+					sqlite3_column_double(st,3),
+					sqlite3_column_double(st,4),
+					sqlite3_column_double(st,5));
+			}
+		}
+		sqlite3_finalize(st);
+	}
+	len += snprintf(out + len, 65536 - len, "]}");
+	send_status(fd, 200, "application/json", out, len);
+	free(out);
+}
+
 static void route_sessions_delete(int fd, int id)
 {
 	char sql[128];
@@ -1222,6 +1456,32 @@ static void http_handle(int idx)
 		const char *q = strchr(path, '?');
 		if (q) { const char *l = strstr(q, "limit="); if (l) limit = atoi(l + 6); }
 		route_discovery_list(c->fd, limit);
+		http_drop(idx); return;
+	}
+	if (!strcmp(method, "GET") && !strcmp(path, "/wans")) {
+		route_wans_snapshot(c->fd); http_drop(idx); return;
+	}
+	if (!strcmp(method, "GET") &&
+	    (!strcmp(path, "/events") || !strncmp(path, "/events?", 8))) {
+		int64_t since = 0;
+		int limit = 100;
+		char kind[32] = "";
+		const char *q = strchr(path, '?');
+		if (q) {
+			const char *s = strstr(q, "since=");
+			if (s) since = strtoll(s + 6, NULL, 10);
+			const char *l = strstr(q, "limit=");
+			if (l) limit = atoi(l + 6);
+			const char *k = strstr(q, "kind=");
+			if (k) {
+				size_t n = 0;
+				const char *p2 = k + 5;
+				while (*p2 && *p2 != '&' && n < sizeof(kind) - 1)
+					kind[n++] = *p2++;
+				kind[n] = '\0';
+			}
+		}
+		route_events_recent(c->fd, since, kind, limit);
 		http_drop(idx); return;
 	}
 	if (!strcmp(method, "GET") &&
