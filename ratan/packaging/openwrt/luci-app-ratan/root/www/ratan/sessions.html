@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: GPL-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RATAN · Sessions</title>
+<link rel="stylesheet" href="ratan.css">
+</head>
+<body>
+<main>
+    <div class="toolbar">
+        <button onclick="newSession()">+ Start new session</button>
+        <span class="muted">or use <span class="mono">ratan-test record --recipe ...</span> from the CLI</span>
+        <span style="margin-left:auto"><a href="#" onclick="refresh();return false">refresh</a></span>
+    </div>
+    <div id="content"><div class="empty">loading…</div></div>
+</main>
+<script src="ratan.js"></script>
+<script>
+renderHeader("sessions");
+
+async function refresh() {
+    try {
+        const d = await apiGet("/sessions");
+        const rows = (d.sessions || []).map(s => `
+            <tr>
+                <td>${s.id}</td>
+                <td>${escapeHtml(s.name)}</td>
+                <td><span class="state ${s.status === 'recording' ? 'TRANSIENT' : 'HEALTHY'}">${s.status}</span></td>
+                <td class="mono">${(s.started_ns/1e9).toFixed(1)}s</td>
+                <td class="mono">${s.ended_ns ? ((s.ended_ns - s.started_ns)/1e9).toFixed(1) + 's' : '—'}</td>
+                <td>
+                    <a class="btn" href="/cgi-bin/ratan-api/sessions/${s.id}/download">Download</a>
+                    <button onclick="showDetails(${s.id})" class="secondary">Details</button>
+                    ${s.status === 'recording'
+                        ? `<button onclick="stopSession(${s.id})">Stop</button>`
+                        : `<button onclick="deleteSession(${s.id})" class="danger">Delete</button>`}
+                </td>
+            </tr>`).join("");
+        document.getElementById("content").innerHTML = rows.length
+            ? `<table>
+                <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Started</th><th>Duration</th><th>Actions</th></tr></thead>
+                <tbody>${rows}</tbody>
+              </table>
+              <div id="details" style="margin-top:16px"></div>`
+            : `<div class="empty">No sessions yet. Click + Start new session above, or run<br>
+               <span class="mono">ratan-test record --name first --duration 30 --inject "at:5s mark:test"</span></div>`;
+    } catch (e) {
+        showError("content", e);
+    }
+}
+
+async function newSession() {
+    const name = prompt("Session name?", "manual-" + Math.floor(Date.now() / 1000));
+    if (!name) return;
+    try {
+        await apiPost("/sessions", { name: name, metadata: { source: "ui" } });
+        refresh();
+    } catch (e) { alert("Could not start session: " + e.message); }
+}
+
+async function stopSession(id) {
+    if (!confirm(`Stop session ${id}?`)) return;
+    try {
+        const result = await apiPost(`/sessions/${id}/stop`);
+        refresh();
+        document.getElementById("details").innerHTML =
+            `<h2>Session ${id} summary</h2>
+             <pre class="event-log">${escapeHtml(JSON.stringify(result, null, 2))}</pre>`;
+    } catch (e) { alert("Stop failed: " + e.message); }
+}
+
+async function deleteSession(id) {
+    if (!confirm(`Permanently delete session ${id} and all linked rows?`)) return;
+    try {
+        await apiDelete(`/sessions/${id}`);
+        refresh();
+    } catch (e) { alert("Delete failed: " + e.message); }
+}
+
+async function showDetails(id) {
+    try {
+        const d = await apiGet(`/sessions/${id}`);
+        document.getElementById("details").innerHTML =
+            `<h2>Session ${id} (${escapeHtml(d.name)})</h2>
+             <pre class="event-log">${escapeHtml(JSON.stringify(d, null, 2))}</pre>`;
+    } catch (e) { alert("Details failed: " + e.message); }
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

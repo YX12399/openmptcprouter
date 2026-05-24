@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+#
+# Runs once at first boot to wire up the LuCI menu cache.
+#
+# /run/ratan is created by ratan-telemetry's init; the symlink to expose
+# it at /www/ratan-data is set up by luci-app-ratan's postinst. Nothing
+# else is required here -- LuCI auto-discovers our menu.d JSON.
+
+# Clear LuCI's compiled menu cache so the new entry appears immediately.
+rm -f /tmp/luci-indexcache
+rm -f /tmp/luci-modulecache/*
+
+exit 0

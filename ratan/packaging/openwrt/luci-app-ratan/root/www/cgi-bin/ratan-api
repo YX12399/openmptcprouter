@@ -1,0 +1,72 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+#
+# /www/cgi-bin/ratan-api -- thin proxy from LuCI UI to the local
+# ratan_telemetryd HTTP API. The daemon binds to 127.0.0.1 only; this
+# CGI is the only public-facing path to it (under uhttpd, which is
+# already auth-gated by LuCI when accessed through the menu link).
+#
+# CGI env we use:
+#   PATH_INFO       e.g. "/sessions/1/download"   (request after /cgi-bin/ratan-api)
+#   QUERY_STRING    e.g. "limit=50"
+#   REQUEST_METHOD  GET | POST | DELETE
+#   CONTENT_LENGTH  for POST bodies (read from stdin)
+#
+# Notes:
+#   - SSE streaming intentionally not proxied here (CGI buffers); the
+#     Live page polls /metrics + /events instead. Real SSE proxy is a
+#     follow-up using uhttpd's url-rewrite OR a tiny socat helper.
+#   - All upstream errors are surfaced as JSON so the JS UI can show
+#     them inline (rather than a blank screen on daemon-down).
+
+set -e
+
+DAEMON="${RATAN_DAEMON_URL:-http://127.0.0.1:9180}"
+
+# Default to /healthz if no path given (useful for a quick liveness probe).
+P="${PATH_INFO:-/healthz}"
+
+# Build the upstream URL. Reject any path that doesn't start with /, so
+# we can't be tricked into hitting an arbitrary host.
+case "$P" in
+    /*) ;;
+    *)  printf 'Status: 400 Bad Request\r\n'
+        printf 'Content-Type: application/json\r\n\r\n'
+        printf '{"error":"bad path"}\n'
+        exit 0 ;;
+esac
+
+URL="$DAEMON$P"
+[ -n "$QUERY_STRING" ] && URL="$URL?$QUERY_STRING"
+
+# Common headers (CORS so a Vercel dashboard could in theory talk to us
+# via an authenticated relay; not exposed here unless the admin opens
+# the port).
+printf 'Content-Type: application/json\r\n'
+printf 'Access-Control-Allow-Origin: *\r\n'
+printf 'Cache-Control: no-store\r\n\r\n'
+
+case "$REQUEST_METHOD" in
+    GET|"")
+        if ! curl -sS --max-time 5 "$URL" 2>&1; then
+            printf '{"error":"upstream unreachable","url":"%s"}\n' "$URL"
+        fi
+        ;;
+    POST)
+        # Forward the body as-is. Daemon expects application/json.
+        body=$(cat)
+        if ! printf '%s' "$body" | curl -sS --max-time 5 -X POST \
+                -H "Content-Type: application/json" \
+                --data-binary @- "$URL" 2>&1; then
+            printf '{"error":"upstream unreachable","url":"%s"}\n' "$URL"
+        fi
+        ;;
+    DELETE)
+        if ! curl -sS --max-time 5 -X DELETE "$URL" 2>&1; then
+            printf '{"error":"upstream unreachable","url":"%s"}\n' "$URL"
+        fi
+        ;;
+    *)
+        printf '{"error":"method not allowed","method":"%s"}\n' "$REQUEST_METHOD"
+        ;;
+esac

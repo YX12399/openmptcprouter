@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: GPL-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RATAN · Live</title>
+<link rel="stylesheet" href="ratan.css">
+</head>
+<body>
+<main>
+    <div class="toolbar">
+        <label>Auto-scroll <input type="checkbox" id="autoscroll" checked></label>
+        <label>Refresh
+            <select id="rate">
+                <option value="500">500ms</option>
+                <option value="1000" selected>1s</option>
+                <option value="2000">2s</option>
+                <option value="5000">5s</option>
+            </select>
+        </label>
+        <button onclick="document.getElementById('log').innerHTML=''">clear</button>
+        <span class="muted" style="margin-left:auto">
+            polling /metrics + /discovery + /flows + handover-status
+        </span>
+    </div>
+
+    <div id="kpis" style="margin-bottom:12px"></div>
+
+    <div class="event-log" id="log"></div>
+
+    <p class="muted" style="margin-top:8px">
+        Note: this page polls. True SSE streaming (lower latency, no buffering)
+        requires a uhttpd url-rewrite proxy that's a follow-up commit. For
+        per-event live data today, run <span class="mono">curl -N http://127.0.0.1:9180/stream</span>
+        on the router.
+    </p>
+</main>
+<script src="ratan.js"></script>
+<script>
+renderHeader("live");
+
+let lastSnapshot = { samples: 0, flows: 0, mos: 0, transitions: 0, weights: 0 };
+
+function logLine(kind, text) {
+    const log = document.getElementById("log");
+    const ts = new Date().toLocaleTimeString();
+    const line = document.createElement("div");
+    line.innerHTML =
+        `<span class="ts">${ts}</span> <span class="kind-${kind}">[${kind}]</span> ${escapeHtml(text)}`;
+    log.appendChild(line);
+    while (log.children.length > 500) log.removeChild(log.firstChild);
+    if (document.getElementById("autoscroll").checked)
+        log.scrollTop = log.scrollHeight;
+}
+
+const PARSE_PROM = (text) => {
+    const out = {};
+    for (const line of text.split("\n")) {
+        if (line.startsWith("#") || !line.trim()) continue;
+        const space = line.lastIndexOf(" ");
+        if (space < 0) continue;
+        const name = line.slice(0, space).trim().replace(/\{.*\}/, "");
+        const val = parseFloat(line.slice(space + 1));
+        if (!isNaN(val)) out[name] = val;
+    }
+    return out;
+};
+
+async function tick() {
+    try {
+        const mRaw = await fetch("/cgi-bin/ratan-api/metrics",
+                                  { cache: "no-store" }).then(r => r.text());
+        const m = PARSE_PROM(mRaw);
+
+        document.getElementById("kpis").innerHTML = `
+            <span class="kpi"><div class="v">${m.ratan_samples_total || 0}</div><div class="l">samples total</div></span>
+            <span class="kpi"><div class="v">${m.ratan_samples_loss || 0}</div><div class="l">losses</div></span>
+            <span class="kpi"><div class="v">${m.ratan_samples_failover || 0}</div><div class="l">fast failovers</div></span>
+            <span class="kpi"><div class="v">${m.ratan_state_transitions_total || 0}</div><div class="l">state changes</div></span>
+            <span class="kpi"><div class="v">${m.ratan_flow_events_total || 0}</div><div class="l">flows</div></span>
+            <span class="kpi"><div class="v">${m.ratan_mos_events_total || 0}</div><div class="l">MOS samples</div></span>
+        `;
+
+        // Diff vs last snapshot -> log lines
+        const delta = (key) => (m[key] || 0) - (lastSnapshot[key] || 0);
+        const d_samples = delta("ratan_samples_total");
+        const d_loss = delta("ratan_samples_loss");
+        const d_failover = delta("ratan_samples_failover");
+        const d_state = delta("ratan_state_transitions_total");
+        const d_flow = delta("ratan_flow_events_total");
+        const d_mos = delta("ratan_mos_events_total");
+        const d_discovery = delta("ratan_discovery_events_total");
+
+        if (d_samples > 0) logLine("sample", `+${d_samples} samples`);
+        if (d_loss > 0) logLine("sample", `+${d_loss} LOSS sample(s)`);
+        if (d_failover > 0) logLine("weight", `+${d_failover} FAST FAILOVER (prober wrote weight=0)`);
+        if (d_state > 0) logLine("state", `+${d_state} state transition(s)`);
+        if (d_flow > 0) logLine("flow", `+${d_flow} flow event(s)`);
+        if (d_mos > 0) logLine("mos", `+${d_mos} MOS sample(s)`);
+        if (d_discovery > 0) logLine("discovery", `+${d_discovery} discovery event(s)`);
+
+        lastSnapshot = {
+            ratan_samples_total: m.ratan_samples_total || 0,
+            ratan_samples_loss: m.ratan_samples_loss || 0,
+            ratan_samples_failover: m.ratan_samples_failover || 0,
+            ratan_state_transitions_total: m.ratan_state_transitions_total || 0,
+            ratan_flow_events_total: m.ratan_flow_events_total || 0,
+            ratan_mos_events_total: m.ratan_mos_events_total || 0,
+            ratan_discovery_events_total: m.ratan_discovery_events_total || 0,
+        };
+
+        // Handover armed state changes are interesting
+        const ho = await fetchHandoverStatus();
+        if (ho && ho.wans) {
+            for (const w of ho.wans) {
+                if (w.currently_armed) {
+                    logLine("inject", `WAN ${w.wan_id}: handover ARMED (${w.confidence}, next in ${fmtDuration(w.next_predicted_in_s)})`);
+                }
+            }
+        }
+    } catch (e) {
+        logLine("state", "ERROR: " + e.message);
+    }
+}
+
+let timer = null;
+function reschedule() {
+    if (timer) clearInterval(timer);
+    timer = setInterval(tick, parseInt(document.getElementById("rate").value, 10));
+}
+document.getElementById("rate").addEventListener("change", reschedule);
+
+logLine("state", "live page initialised; polling every 1s");
+tick();
+reschedule();
+</script>
+</body>
+</html>

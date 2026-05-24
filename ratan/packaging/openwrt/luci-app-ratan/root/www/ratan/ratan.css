@@ -1,0 +1,199 @@
+/* SPDX-License-Identifier: GPL-2.0
+ * ratan.css -- minimal styling for the RATAN LuCI dashboard.
+ * Goal: look at home next to LuCI's stock pages; no framework bloat.
+ */
+
+:root {
+    --ok: #1d7a1d;
+    --warn: #b87a00;
+    --bad: #c0392b;
+    --transient: #2980b9;
+    --bg: #f6f6f6;
+    --card-bg: #ffffff;
+    --border: #d0d0d0;
+    --text: #222;
+    --muted: #777;
+    --mono: ui-monospace, Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 14px;
+    line-height: 1.4;
+}
+
+header {
+    background: #2d3e50;
+    color: white;
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    border-bottom: 3px solid #1a2530;
+}
+header h1 { margin: 0; font-size: 18px; font-weight: 500; }
+header nav { display: flex; gap: 4px; flex-wrap: wrap; }
+header nav a {
+    color: #bcd;
+    text-decoration: none;
+    padding: 4px 10px;
+    border-radius: 3px;
+    font-size: 13px;
+}
+header nav a:hover { background: rgba(255,255,255,0.1); color: white; }
+header nav a.active { background: rgba(255,255,255,0.2); color: white; }
+header .conn {
+    margin-left: auto;
+    font-size: 12px;
+    font-family: var(--mono);
+    opacity: 0.7;
+}
+header .conn.ok { color: #9f9; }
+header .conn.bad { color: #f99; }
+
+main { padding: 16px 20px; max-width: 1400px; }
+
+h2 { margin-top: 0; font-size: 16px; font-weight: 500; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); font-size: 12px; }
+
+.cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+}
+
+.card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 12px 16px;
+}
+.card h3 {
+    margin: 0 0 8px;
+    font-size: 14px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.card .row {
+    display: flex;
+    justify-content: space-between;
+    padding: 3px 0;
+    font-size: 13px;
+}
+.card .row .label { color: var(--muted); }
+.card .row .val { font-family: var(--mono); }
+
+.state {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: white;
+}
+.state.HEALTHY   { background: var(--ok); }
+.state.TRANSIENT { background: var(--transient); }
+.state.DEGRADING { background: var(--warn); }
+.state.DOWN      { background: var(--bad); }
+
+.confidence {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-family: var(--mono);
+    border: 1px solid var(--border);
+}
+.confidence.tight   { color: white; background: var(--ok); border-color: var(--ok); }
+.confidence.loose   { color: white; background: var(--warn); border-color: var(--warn); }
+.confidence.chaotic { color: white; background: var(--bad); border-color: var(--bad); }
+.confidence.cold    { color: var(--muted); }
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    font-size: 13px;
+}
+th, td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+}
+th { background: #ececec; font-size: 12px; font-weight: 600; color: #555; }
+tr:last-child td { border-bottom: 0; }
+tr:hover { background: #fafafa; }
+
+button, .btn {
+    background: #2980b9;
+    color: white;
+    border: 0;
+    padding: 5px 12px;
+    border-radius: 3px;
+    font-size: 12px;
+    cursor: pointer;
+    text-decoration: none;
+    display: inline-block;
+}
+button:hover, .btn:hover { background: #1f6391; }
+button.danger, .btn.danger { background: var(--bad); }
+button.danger:hover, .btn.danger:hover { background: #962c20; }
+button.secondary, .btn.secondary { background: #888; }
+
+.event-log {
+    background: #1e1e1e;
+    color: #d0d0d0;
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 10px;
+    border-radius: 4px;
+    height: 360px;
+    overflow-y: scroll;
+    white-space: pre;
+}
+.event-log .ts { color: #888; }
+.event-log .kind-sample { color: #6cc; }
+.event-log .kind-state { color: #cc6; }
+.event-log .kind-weight { color: #c6c; }
+.event-log .kind-inject { color: #fc6; }
+.event-log .kind-discovery { color: #9c9; }
+.event-log .kind-flow { color: #6f9; }
+.event-log .kind-mos { color: #f9c; }
+
+.toolbar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+}
+.toolbar label { font-size: 12px; color: var(--muted); }
+.toolbar input { padding: 4px 8px; font-size: 13px; border: 1px solid var(--border); border-radius: 3px; }
+
+.empty { color: var(--muted); font-style: italic; padding: 16px; text-align: center; }
+
+.kpi {
+    display: inline-block;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 8px 14px;
+    margin-right: 8px;
+    margin-bottom: 8px;
+}
+.kpi .v { font-size: 20px; font-family: var(--mono); font-weight: 600; }
+.kpi .l { font-size: 11px; color: var(--muted); }

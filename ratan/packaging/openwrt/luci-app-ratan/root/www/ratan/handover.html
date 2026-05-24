@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: GPL-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RATAN · Handover predictor</title>
+<link rel="stylesheet" href="ratan.css">
+</head>
+<body>
+<main>
+    <p class="muted">
+        Status of the per-WAN Starlink handover predictor (Step 9). Confidence tiers:
+        <span class="confidence tight">tight</span> CoV &lt; 0.20 (predictions armed),
+        <span class="confidence loose">loose</span> CoV &lt; 0.50 (wider acceptance window),
+        <span class="confidence chaotic">chaotic</span> CoV ≥ 0.50 (no prediction; reactive only),
+        <span class="confidence cold">cold</span> not enough events yet.
+    </p>
+    <div id="content"><div class="empty">loading…</div></div>
+    <h2 style="margin-top:24px">Recent handover events from <span class="mono">flows</span>+samples</h2>
+    <p class="muted">
+        The classifier logs each handover detection. Confirm by tailing
+        <span class="mono">logread -e ratan-classifier</span> on the router, or check the
+        <span class="mono">state_transitions</span> table via the session downloads on the
+        <a href="sessions.html">Sessions</a> page.
+    </p>
+</main>
+<script src="ratan.js"></script>
+<script>
+renderHeader("handover");
+
+async function refresh() {
+    const ho = await fetchHandoverStatus();
+    if (!ho || !ho.wans) {
+        document.getElementById("content").innerHTML =
+            `<div class="empty">Handover status file not yet written.<br>
+             Is <span class="mono">ratan-classifier</span> running?</div>`;
+        return;
+    }
+    const written = ho.wrote_at_wall ? new Date(ho.wrote_at_wall * 1000).toLocaleTimeString() : "—";
+    document.getElementById("content").innerHTML = `
+        <p class="muted" style="margin-bottom:12px">Last update: ${written}</p>
+        <div class="cards">
+        ${ho.wans.map(w => `
+            <div class="card">
+                <h3>WAN ${w.wan_id}
+                    <span class="confidence ${w.confidence}">${w.confidence}</span>
+                </h3>
+                <div class="row"><span class="label">Events detected</span>
+                                 <span class="val">${w.events_total}</span></div>
+                <div class="row"><span class="label">Intervals tracked</span>
+                                 <span class="val">${w.intervals_tracked} / 20</span></div>
+                <div class="row"><span class="label">CoV (sigma/mean)</span>
+                                 <span class="val">${w.cov === null ? '—' : w.cov.toFixed(3)}</span></div>
+                <div class="row"><span class="label">Median interval</span>
+                                 <span class="val">${w.median_interval_s === null ? '—' : w.median_interval_s.toFixed(1) + 's'}</span></div>
+                <div class="row"><span class="label">Next handover in</span>
+                                 <span class="val">${w.next_predicted_in_s === null ? '—' : fmtDuration(w.next_predicted_in_s)}</span></div>
+                <div class="row"><span class="label">Miss streak</span>
+                                 <span class="val">${w.miss_streak} / 3</span></div>
+                <div class="row"><span class="label">Currently armed</span>
+                                 <span class="val">${w.currently_armed
+                                    ? '<span style="color:var(--warn);font-weight:600">YES</span>'
+                                    : 'no'}</span></div>
+            </div>`).join("")}
+        </div>`;
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

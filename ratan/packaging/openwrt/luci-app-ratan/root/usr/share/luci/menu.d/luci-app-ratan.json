@@ -1,0 +1,33 @@
+{
+	"admin/network/ratan": {
+		"title": "RATAN",
+		"order": 90,
+		"action": {
+			"type": "view",
+			"path": "ratan/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-ratan" ]
+		}
+	},
+	"admin/network/ratan/overview": {
+		"title": "Overview",
+		"order": 1,
+		"action": { "type": "view", "path": "ratan/overview" }
+	},
+	"admin/network/ratan/live": {
+		"title": "Live",
+		"order": 2,
+		"action": { "type": "view", "path": "ratan/live" }
+	},
+	"admin/network/ratan/sessions": {
+		"title": "Sessions",
+		"order": 3,
+		"action": { "type": "view", "path": "ratan/sessions" }
+	},
+	"admin/network/ratan/handover": {
+		"title": "Handover",
+		"order": 4,
+		"action": { "type": "view", "path": "ratan/handover" }
+	}
+}

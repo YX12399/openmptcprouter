@@ -24,7 +24,7 @@ ratan/
 └── scripts/                        build wrappers                                  [STEP 10]
 ```
 
-## Current state — Steps 1–5 + 9 of 17
+## Current state — Steps 1–5, 9, 11 of 17
 
 Shipped (Step 1, scheduler source):
 - `src/sched/ratan_sched.bpf.c` — BPF struct_ops MPTCP scheduler. Default behavior = highest weight in a pinned `ratan_path_weights` map wins; falls back to first-active subflow if weights are all zero.
@@ -123,7 +123,20 @@ Shipped (Step 9, handover predictor — variable 15-60s cadence):
 - Starlink LEO satellite handovers happen every **15-60 seconds** (variable per session, not fixed 15s). The FSM is cadence-agnostic; the prediction layer (Step 9) tracks inter-handover intervals over a sliding window and pre-empts only when the coefficient of variation indicates consistent cadence.
 - Compound case (minor obstruction + handover) verified by unit test `test_minor_obstruction_plus_handovers_stays_usable` and by the new `starlink_obstruction_plus_handover.yaml` recipe. FSM correctly stays HEALTHY at 2% baseline (the call-routing decision belongs to QoS layer Step 8, not the classifier).
 
-### Step 5 complete. What we can do today:
+Shipped (Step 11, LuCI dashboard — the first user-visible artifact):
+- `packaging/openwrt/luci-app-ratan/` — pure-static HTML/JS dashboard served by uhttpd; no framework bloat. Pages: **Overview** (per-WAN cards with confidence tier + handover stats + 8-KPI counter strip), **Live** (auto-refreshing event-log with kind-color-coding), **Sessions** (list/create/stop/download/delete via the daemon HTTP API), **Handover** (per-WAN predictor status — confidence tier, CoV, median interval, next predicted, miss streak, armed state).
+- `root/www/cgi-bin/ratan-api` — tiny shell CGI proxy from `/cgi-bin/ratan-api/<path>` to `http://127.0.0.1:9180/<path>`. Keeps the daemon port firewall-internal. Surfaces upstream errors as JSON so the UI shows them inline (not blank screens).
+- `root/www/ratan/{overview,live,sessions,handover,index}.html` + `ratan.css` + `ratan.js` (~4500 LOC across all pages). Vanilla JS, `fetch()`, no jQuery. Pages auto-refresh on 1-5s cadences. Sessions page has working Download / Stop / Delete / Start-new buttons.
+- `root/usr/share/luci/menu.d/luci-app-ratan.json` — adds menu entries under **Network → RATAN → {Overview, Live, Sessions, Handover}**.
+- `root/usr/share/rpcd/acl.d/luci-app-ratan.json` — grants the read permissions.
+- Postinst symlinks `/run/ratan` to `/www/ratan-data` so the static pages can `fetch('/ratan-data/handover-status.json')` without a CGI roundtrip.
+- `ratan-full` metapackage now depends on `+luci-app-ratan`.
+
+**Verified locally**: all 7 files (4 HTML + index + CSS + JS) serve 200; CGI-style proxy to `/metrics` and `/healthz` works.
+
+**Live SSE proxy is intentionally deferred** — shell CGI buffers; the Live page polls instead. Future commit adds uhttpd url-rewrite for true SSE OR a small socat helper.
+
+### Step 11 complete. What we can do today:
 
 ```sh
 # build everything in src/telemetry/

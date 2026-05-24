@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: GPL-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RATAN · Overview</title>
+<link rel="stylesheet" href="ratan.css">
+</head>
+<body>
+<main>
+    <div id="kpis"><span class="muted">loading...</span></div>
+    <h2 style="margin-top:24px">Per-WAN status</h2>
+    <div class="cards" id="wan-cards"><div class="empty">loading…</div></div>
+    <h2 style="margin-top:24px">Last 10 state transitions</h2>
+    <div id="transitions"></div>
+</main>
+<script src="ratan.js"></script>
+<script>
+renderHeader("overview");
+
+const PARSE_PROM = (text) => {
+    /* Quick-and-dirty Prometheus text parser: returns {metric: value}. */
+    const out = {};
+    for (const line of text.split("\n")) {
+        if (line.startsWith("#") || !line.trim()) continue;
+        const space = line.lastIndexOf(" ");
+        if (space < 0) continue;
+        const name = line.slice(0, space).trim().replace(/\{.*\}/, "");
+        const val = parseFloat(line.slice(space + 1));
+        if (!isNaN(val)) out[name] = val;
+    }
+    return out;
+};
+
+async function refresh() {
+    try {
+        // Metrics counters
+        const mRaw = await fetch("/cgi-bin/ratan-api/metrics",
+                                  { cache: "no-store" }).then(r => r.text());
+        const m = PARSE_PROM(mRaw);
+        document.getElementById("kpis").innerHTML = `
+            <span class="kpi"><div class="v">${m.ratan_samples_total || 0}</div><div class="l">samples</div></span>
+            <span class="kpi"><div class="v">${m.ratan_samples_loss || 0}</div><div class="l">losses</div></span>
+            <span class="kpi"><div class="v">${m.ratan_samples_failover || 0}</div><div class="l">fast failovers</div></span>
+            <span class="kpi"><div class="v">${m.ratan_state_transitions_total || 0}</div><div class="l">state transitions</div></span>
+            <span class="kpi"><div class="v">${m.ratan_flow_events_total || 0}</div><div class="l">flow events</div></span>
+            <span class="kpi"><div class="v">${m.ratan_mos_events_total || 0}</div><div class="l">MOS samples</div></span>
+            <span class="kpi"><div class="v">${m.ratan_sessions_started_total || 0}</div><div class="l">sessions started</div></span>
+            <span class="kpi"><div class="v">${m.ratan_sse_clients || 0}</div><div class="l">live subscribers</div></span>
+        `;
+
+        // Per-WAN composite from handover-status + recent state transitions.
+        const [ho, txns] = await Promise.all([
+            fetchHandoverStatus(),
+            apiGet("/sessions").then(async d => {
+                /* If we don't have a /state_transitions list endpoint yet,
+                 * we can derive what we need from session downloads -- but
+                 * for the overview we just need recent ones globally.
+                 * Use a small inline query via /sessions/latest hack: skip. */
+                return null;
+            }).catch(() => null),
+        ]);
+
+        const wans = (ho && ho.wans) || [];
+        if (wans.length === 0) {
+            document.getElementById("wan-cards").innerHTML =
+                `<div class="empty">No WAN data yet. Is the classifier running?<br>
+                 <span class="mono">/etc/init.d/ratan-classifier start</span></div>`;
+        } else {
+            document.getElementById("wan-cards").innerHTML = wans.map(w => `
+                <div class="card">
+                    <h3>WAN ${w.wan_id}
+                        <span class="confidence ${w.confidence}">${w.confidence}</span>
+                    </h3>
+                    <div class="row"><span class="label">Handover events seen</span>
+                                     <span class="val">${w.events_total}</span></div>
+                    <div class="row"><span class="label">Intervals tracked</span>
+                                     <span class="val">${w.intervals_tracked}</span></div>
+                    <div class="row"><span class="label">CoV (variance)</span>
+                                     <span class="val">${w.cov === null ? '—' : w.cov.toFixed(3)}</span></div>
+                    <div class="row"><span class="label">Median interval</span>
+                                     <span class="val">${w.median_interval_s === null ? '—' : w.median_interval_s.toFixed(1) + 's'}</span></div>
+                    <div class="row"><span class="label">Next predicted</span>
+                                     <span class="val">${w.next_predicted_in_s === null ? '—' : fmtDuration(w.next_predicted_in_s)}</span></div>
+                    <div class="row"><span class="label">Miss streak</span>
+                                     <span class="val">${w.miss_streak}</span></div>
+                    <div class="row"><span class="label">Currently armed</span>
+                                     <span class="val">${w.currently_armed ? '<span style="color:var(--warn)">yes</span>' : 'no'}</span></div>
+                </div>
+            `).join("");
+        }
+
+        // Recent transitions: we don't yet have an /events query endpoint,
+        // so this section stays empty for now. Could be added by querying
+        // the daemon's most recent session if one is active. For now,
+        // direct users to the Live page.
+        document.getElementById("transitions").innerHTML =
+            `<div class="muted">See <a href="live.html">Live</a> for the realtime event stream.</div>`;
+
+    } catch (e) {
+        showError("kpis", e);
+    }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
