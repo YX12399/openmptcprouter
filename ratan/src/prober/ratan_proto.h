@@ -101,4 +101,22 @@ struct ratan_inject_event {
 	char     detail[64];   /* free-form (loss%, duration, etc.) */
 } __attribute__((packed));
 
+/* Discovery-event payload (RATAN_EVENT_DISCOVERY). Written by the in-process
+ * discover thread on netlink + inotify events. 136 bytes.
+ *   kind:   one of "iface_up", "iface_down", "addr_add", "addr_del",
+ *           "neighbor_add", "neighbor_del", "dhcp_lease_add",
+ *           "dhcp_lease_del", "snapshot_iface", "snapshot_addr",
+ *           "snapshot_neighbor", "snapshot_lease"
+ *   detail: compact JSON, e.g.
+ *           {"iface":"wan0","mtu":1500,"flags":"UP,RUNNING"}
+ *           {"iface":"wan0","addr":"192.168.1.5/24","family":4}
+ *           {"iface":"br-lan","ip":"192.168.1.20","mac":"aa:bb:cc:dd:ee:ff"}
+ *           {"mac":"aa:..","ip":"...","host":"laptop","expiry":1700000000}
+ */
+struct ratan_discovery_event {
+	uint64_t ts_ns;
+	char     kind[24];
+	char     detail[104];
+} __attribute__((packed));
+
 #endif /* RATAN_PROTO_H */

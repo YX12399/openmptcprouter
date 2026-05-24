@@ -52,12 +52,14 @@
 #include <sqlite3.h>
 
 #include "../prober/ratan_proto.h"
+#include "discover.h"
 
 #define DEFAULT_DB_PATH       "/var/lib/ratan/telemetry.db"
 #define DEFAULT_SOCK_PATH     "/run/ratan/telemetry.sock"
 #define DEFAULT_HTTP_HOST     "127.0.0.1"
 #define DEFAULT_HTTP_PORT     9180
 #define DEFAULT_SCHEMA_PATH   "/usr/share/ratan/schema.sql"
+#define DEFAULT_LEASE_FILE    "/tmp/dhcp.leases"
 
 #define MAX_HTTP_CLIENTS      32
 #define HTTP_REQ_MAX          8192
@@ -70,7 +72,8 @@ static volatile sig_atomic_t g_stop;
 
 static bool g_foreground;
 
-static void logf_(int prio, const char *fmt, ...)
+/* Public (non-static) so discover.c can call it without exposing more API. */
+void logf_(int prio, const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
@@ -96,6 +99,7 @@ static struct {
 	atomic_ullong samples_failover;
 	atomic_ullong state_transitions_total;
 	atomic_ullong weight_changes_total;
+	atomic_ullong discovery_events_total;
 	atomic_ullong http_requests_total;
 	atomic_ullong sse_clients_current;
 	atomic_ullong sessions_started_total;
@@ -110,6 +114,7 @@ static sqlite3_stmt *g_st_ins_sample;
 static sqlite3_stmt *g_st_ins_state;
 static sqlite3_stmt *g_st_ins_weight;
 static sqlite3_stmt *g_st_ins_inject;
+static sqlite3_stmt *g_st_ins_discovery;
 static sqlite3_stmt *g_st_ins_session;
 static sqlite3_stmt *g_st_get_session;
 static sqlite3_stmt *g_st_stop_session;
@@ -170,6 +175,8 @@ static int db_init(const char *path, const char *schema_path)
 		"INSERT INTO injects(ts_ns,session_id,action,target,detail) "
 		"VALUES (?,?,?,?,?)",
 
+		"INSERT INTO discovery(ts_ns,kind,detail) VALUES (?,?,?)",
+
 		"INSERT INTO sessions(name,started_ns,metadata) VALUES (?,?,?)",
 		"SELECT id,name,started_ns,ended_ns,status,metadata,summary FROM sessions WHERE id=?",
 		"UPDATE sessions SET ended_ns=?, status=?, summary=? WHERE id=?",
@@ -177,7 +184,7 @@ static int db_init(const char *path, const char *schema_path)
 	};
 	sqlite3_stmt **slots[] = {
 		&g_st_ins_sample, &g_st_ins_state, &g_st_ins_weight,
-		&g_st_ins_inject,
+		&g_st_ins_inject, &g_st_ins_discovery,
 		&g_st_ins_session, &g_st_get_session, &g_st_stop_session,
 		&g_st_active_session,
 	};
@@ -358,6 +365,26 @@ static void on_weight(const struct ratan_weight_event *e)
 	if (n > 0) sse_broadcast(j, (size_t)n);
 }
 
+static void on_discovery(const struct ratan_discovery_event *e)
+{
+	atomic_fetch_add(&g_metrics.discovery_events_total, 1);
+	sqlite3_reset(g_st_ins_discovery);
+	sqlite3_bind_int64(g_st_ins_discovery, 1, (sqlite3_int64)e->ts_ns);
+	sqlite3_bind_text (g_st_ins_discovery, 2, e->kind,   -1, SQLITE_TRANSIENT);
+	sqlite3_bind_text (g_st_ins_discovery, 3, e->detail, -1, SQLITE_TRANSIENT);
+	if (sqlite3_step(g_st_ins_discovery) != SQLITE_DONE)
+		LOGW("ins_discovery: %s", sqlite3_errmsg(g_db));
+
+	char j[256], esc_kind[48], esc_det[160];
+	json_escape(esc_kind, sizeof(esc_kind), e->kind);
+	json_escape(esc_det,  sizeof(esc_det),  e->detail);
+	int n = snprintf(j, sizeof(j),
+		"{\"kind\":\"discovery\",\"ts_ns\":%llu,"
+		"\"sub\":\"%s\",\"detail\":\"%s\"}",
+		(unsigned long long)e->ts_ns, esc_kind, esc_det);
+	if (n > 0) sse_broadcast(j, (size_t)n);
+}
+
 static void on_inject(const struct ratan_inject_event *e)
 {
 	/* The injects table has session_id NOT NULL with FK CASCADE -- writing
@@ -413,8 +440,11 @@ static void ingest(const uint8_t *buf, size_t n)
 	case RATAN_EVENT_INJECT:
 		if (h->len == sizeof(struct ratan_inject_event)) on_inject(p);
 		break;
-	/* RATAN_EVENT_DISCOVERY/FLOW/MOS: arriving in subsequent Step 4b
-	 * commits (netlink+inotify+CTNETLINK subscribers + MOS computer). */
+	case RATAN_EVENT_DISCOVERY:
+		if (h->len == sizeof(struct ratan_discovery_event)) on_discovery(p);
+		break;
+	/* RATAN_EVENT_FLOW / MOS: arriving in subsequent Step 4b commits
+	 * (CTNETLINK subscriber + MOS computer). */
 	default:
 		break;
 	}
@@ -491,6 +521,9 @@ static void route_metrics(int fd)
 "# HELP ratan_weight_changes_total BPF weight map writes\n"
 "# TYPE ratan_weight_changes_total counter\n"
 "ratan_weight_changes_total %llu\n"
+"# HELP ratan_discovery_events_total Discovery events ingested (netlink + inotify)\n"
+"# TYPE ratan_discovery_events_total counter\n"
+"ratan_discovery_events_total %llu\n"
 "# HELP ratan_http_requests_total HTTP requests handled\n"
 "# TYPE ratan_http_requests_total counter\n"
 "ratan_http_requests_total %llu\n"
@@ -511,6 +544,7 @@ static void route_metrics(int fd)
 		(unsigned long long)atomic_load(&g_metrics.samples_failover),
 		(unsigned long long)atomic_load(&g_metrics.state_transitions_total),
 		(unsigned long long)atomic_load(&g_metrics.weight_changes_total),
+		(unsigned long long)atomic_load(&g_metrics.discovery_events_total),
 		(unsigned long long)atomic_load(&g_metrics.http_requests_total),
 		(unsigned long long)atomic_load(&g_metrics.sse_clients_current),
 		(unsigned long long)atomic_load(&g_metrics.sessions_started_total),
@@ -876,6 +910,44 @@ static void route_sessions_download(int fd, int id)
 	free(buf);
 }
 
+/* GET /discovery -- returns up to N most recent discovery events. The UI
+ * uses this to render a "currently connected" panel on page load (before
+ * subscribing to /stream for delta updates). Default limit 200. */
+static void route_discovery_list(int fd, int limit)
+{
+	if (limit <= 0 || limit > 2000) limit = 200;
+	sqlite3_stmt *st;
+	const char *q = "SELECT ts_ns,kind,detail FROM discovery "
+			"ORDER BY ts_ns DESC LIMIT ?";
+	if (sqlite3_prepare_v2(g_db, q, -1, &st, NULL) != SQLITE_OK) {
+		send_status(fd, 500, "text/plain", "", 0); return;
+	}
+	sqlite3_bind_int(st, 1, limit);
+
+	char *out = malloc(65536);
+	if (!out) { sqlite3_finalize(st); send_status(fd, 500, "text/plain", "", 0); return; }
+	size_t len = 0;
+	len += snprintf(out + len, 65536 - len, "{\"events\":[");
+	bool first = true;
+	while (sqlite3_step(st) == SQLITE_ROW) {
+		if (65536 - len < 512) break;
+		if (!first) len += snprintf(out + len, 65536 - len, ",");
+		first = false;
+		char esc_kind[48], esc_det[256];
+		json_escape(esc_kind, sizeof(esc_kind),
+			    (const char *)sqlite3_column_text(st, 1));
+		json_escape(esc_det,  sizeof(esc_det),
+			    (const char *)sqlite3_column_text(st, 2));
+		len += snprintf(out + len, 65536 - len,
+			"{\"ts_ns\":%lld,\"kind\":\"%s\",\"detail\":\"%s\"}",
+			(long long)sqlite3_column_int64(st, 0), esc_kind, esc_det);
+	}
+	len += snprintf(out + len, 65536 - len, "]}");
+	sqlite3_finalize(st);
+	send_status(fd, 200, "application/json", out, len);
+	free(out);
+}
+
 static void route_sessions_delete(int fd, int id)
 {
 	char sql[128];
@@ -958,6 +1030,18 @@ static void http_handle(int idx)
 	}
 	if (!strcmp(method, "GET") && !strcmp(path, "/sessions")) {
 		route_sessions_list(c->fd); http_drop(idx); return;
+	}
+	if (!strcmp(method, "GET") &&
+	    (!strcmp(path, "/discovery") || !strncmp(path, "/discovery?", 11))) {
+		/* parse ?limit=N if present */
+		int limit = 200;
+		const char *q = strchr(path, '?');
+		if (q) {
+			const char *l = strstr(q, "limit=");
+			if (l) limit = atoi(l + 6);
+		}
+		route_discovery_list(c->fd, limit);
+		http_drop(idx); return;
 	}
 	if (!strcmp(method, "POST") && !strcmp(path, "/sessions")) {
 		route_sessions_create(c->fd, body); http_drop(idx); return;
@@ -1047,9 +1131,11 @@ static void usage(const char *me)
 "  --sock PATH        %s by default\n"
 "  --http-host IP     %s by default\n"
 "  --http-port N      %d by default\n"
+"  --lease-file PATH  %s by default (dnsmasq leases for discover thread)\n"
+"  --no-discover      don't spawn the netlink+inotify discovery thread\n"
 "  --foreground\n",
 		me, DEFAULT_DB_PATH, DEFAULT_SCHEMA_PATH, DEFAULT_SOCK_PATH,
-		DEFAULT_HTTP_HOST, DEFAULT_HTTP_PORT);
+		DEFAULT_HTTP_HOST, DEFAULT_HTTP_PORT, DEFAULT_LEASE_FILE);
 }
 
 int main(int argc, char **argv)
@@ -1058,16 +1144,21 @@ int main(int argc, char **argv)
 	const char *sock_path   = DEFAULT_SOCK_PATH;
 	const char *schema_path = DEFAULT_SCHEMA_PATH;
 	const char *http_host   = DEFAULT_HTTP_HOST;
+	const char *lease_file  = DEFAULT_LEASE_FILE;
 	uint16_t    http_port   = DEFAULT_HTTP_PORT;
+	bool        run_discover = true;
 
+	enum { OPT_LEASE = 256, OPT_NODISC };
 	static const struct option opts[] = {
-		{ "db",         required_argument, 0, 'd' },
-		{ "schema",     required_argument, 0, 'C' },
-		{ "sock",       required_argument, 0, 's' },
-		{ "http-host",  required_argument, 0, 'H' },
-		{ "http-port",  required_argument, 0, 'P' },
-		{ "foreground", no_argument,       0, 'f' },
-		{ "help",       no_argument,       0, 'h' },
+		{ "db",          required_argument, 0, 'd' },
+		{ "schema",      required_argument, 0, 'C' },
+		{ "sock",        required_argument, 0, 's' },
+		{ "http-host",   required_argument, 0, 'H' },
+		{ "http-port",   required_argument, 0, 'P' },
+		{ "lease-file",  required_argument, 0, OPT_LEASE },
+		{ "no-discover", no_argument,       0, OPT_NODISC },
+		{ "foreground",  no_argument,       0, 'f' },
+		{ "help",        no_argument,       0, 'h' },
 		{ 0 }
 	};
 	int c;
@@ -1078,6 +1169,8 @@ int main(int argc, char **argv)
 		case 's': sock_path = optarg; break;
 		case 'H': http_host = optarg; break;
 		case 'P': http_port = (uint16_t)atoi(optarg); break;
+		case OPT_LEASE: lease_file = optarg; break;
+		case OPT_NODISC: run_discover = false; break;
 		case 'f': g_foreground = true; break;
 		case 'h': default: usage(argv[0]); return c == 'h' ? 0 : 1;
 		}
@@ -1106,6 +1199,12 @@ int main(int argc, char **argv)
 
 	LOGI("listening: telsock=%s http=%s:%u db=%s",
 	     sock_path, http_host, http_port, db_path);
+
+	pthread_t discover_tid = 0;
+	if (run_discover) {
+		if (discover_start(sock_path, lease_file, &g_stop, &discover_tid) < 0)
+			LOGW("discover thread failed to start (continuing without it)");
+	}
 
 	while (!g_stop) {
 		struct pollfd pfds[POLLFD_BASE + MAX_HTTP_CLIENTS];
@@ -1161,6 +1260,8 @@ int main(int argc, char **argv)
 	}
 
 	LOGI("shutting down");
+	g_stop = 1;
+	if (discover_tid) pthread_join(discover_tid, NULL);
 	close(sig_fd); close(http_fd); close(tel_fd);
 	for (int i = 0; i < g_http_n; i++) close(g_http[i].fd);
 	for (int i = 0; i < g_sse_n; i++) close(g_sse[i].fd);
@@ -1168,6 +1269,7 @@ int main(int argc, char **argv)
 	sqlite3_finalize(g_st_ins_state);
 	sqlite3_finalize(g_st_ins_weight);
 	sqlite3_finalize(g_st_ins_inject);
+	sqlite3_finalize(g_st_ins_discovery);
 	sqlite3_finalize(g_st_ins_session);
 	sqlite3_finalize(g_st_get_session);
 	sqlite3_finalize(g_st_stop_session);

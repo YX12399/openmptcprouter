@@ -24,7 +24,7 @@ ratan/
 └── scripts/                        build wrappers                                  [STEP 10]
 ```
 
-## Current state — Steps 1–4b (harness slice) of 17
+## Current state — Steps 1–4b (harness + discovery slices) of 17
 
 Shipped (Step 1, scheduler source):
 - `src/sched/ratan_sched.bpf.c` — BPF struct_ops MPTCP scheduler. Default behavior = highest weight in a pinned `ratan_path_weights` map wins; falls back to first-active subflow if weights are all zero.
@@ -80,7 +80,15 @@ Shipped (Step 4b, harness slice — record/list/download tests from the CLI toda
 
 **Smoke-tested locally end-to-end**: recipe loads → session opens → 3 `mark` injects fire on schedule → each emits a `RATAN_EVENT_INJECT` envelope → daemon persists + broadcasts on SSE within ms → `--output` produces a self-contained, JSON-valid timeline export with all injects (including quote-escaping verified against a `detail` containing `\"` and `\\`).
 
-Not yet shipped: discovery reader (netlink/inotify subscribers), per-flow tracker (CTNETLINK + nDPI), MOS computer. Then: classifier (Step 5), predictor (Step 6), QoS (Step 8), handover learner (Step 9), CLI (Step 10), LuCI UI (Step 11), relay (Step 12), Vercel dashboard (Step 13).
+Shipped (Step 4b, discovery slice — the "what's connected right now" feed):
+- `src/prober/ratan_proto.h` — added `struct ratan_discovery_event` (136 bytes).
+- `src/telemetry/discover.{c,h}` — in-process pthread launched by the daemon. Subscribes to RTNETLINK (`RTMGRP_LINK | IPV4_IFADDR | IPV6_IFADDR | NEIGH`) for iface up/down + IP add/del + LAN-neighbor changes. Also inotify on the dnsmasq lease file (`/tmp/dhcp.leases` by default, configurable) with MAC-keyed diff to emit `dhcp_lease_add` / `dhcp_lease_del`. **Initial snapshot** on startup via `RTM_GETLINK` / `GETADDR` / `GETNEIGH` dumps + a one-shot read of the lease file — so the UI sees current state instantly without waiting for changes. Raw netlink (no libnl dep).
+- `src/telemetry/ratan_telemetryd.c` — handles `RATAN_EVENT_DISCOVERY`: persists to the `discovery` table, broadcasts via SSE. Adds a `GET /discovery?limit=N` endpoint that returns the most recent N events as JSON (the UI's page-load query before subscribing to `/stream` for deltas). New CLI flag `--lease-file`; new metric `ratan_discovery_events_total`.
+- `packaging/openwrt/ratan-telemetry/` — Makefile updated to compile `discover.c` with `-pthread`; UCI gains a `lease_file` option (default `/tmp/dhcp.leases`); init script passes it through.
+
+**Verified locally**: snapshot fires on startup (5 events on a minimal container: 2 ifaces + 2 addrs + 1 neighbor with correct iface names / MTU / flags / IP family / MAC formatting), inotify catches lease changes and correctly emits MAC-keyed diffs (no false adds when an unrelated line changes), SSE broadcast in real time, `/discovery` endpoint returns the snapshot for UI consumption.
+
+Deferred to subsequent Step 4b commits: hostapd UBUS subscriber (WiFi assoc/disassoc, OMR-only, needs libubus), MPTCP genetlink subscriber (`MPTCP_PM_CMD_*` path notifications), per-flow tracker (CTNETLINK + nDPI), MOS computer. Then: classifier (Step 5), predictor (Step 6), QoS (Step 8), handover learner (Step 9), CLI (Step 10), LuCI UI (Step 11), relay (Step 12), Vercel dashboard (Step 13).
 
 ## Building an actual OMR firmware image (Step 2)
 

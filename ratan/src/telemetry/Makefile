@@ -11,8 +11,9 @@ DESTDIR ?=
 
 all: ratan_telemetryd
 
-ratan_telemetryd: ratan_telemetryd.c ../prober/ratan_proto.h
-	$(CC) $(CFLAGS) -I. -I../prober -o $@ $< -lsqlite3
+ratan_telemetryd: ratan_telemetryd.c discover.c discover.h ../prober/ratan_proto.h
+	$(CC) $(CFLAGS) -I. -I../prober -pthread \
+	    -o $@ ratan_telemetryd.c discover.c -lsqlite3
 
 install: all
 	install -d $(DESTDIR)$(PREFIX)/sbin $(DESTDIR)$(PREFIX)/share/ratan

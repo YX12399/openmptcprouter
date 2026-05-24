@@ -28,9 +28,9 @@ define Package/ratan-telemetry
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=RATAN
-  TITLE:=RATAN telemetry daemon (SQLite + HTTP API + SSE)
+  TITLE:=RATAN telemetry daemon (SQLite + HTTP API + SSE + discovery)
   URL:=https://github.com/YX12399/openmptcprouter
-  DEPENDS:=+libsqlite3
+  DEPENDS:=+libsqlite3 +libpthread
 endef
 
 define Package/ratan-telemetry/description
@@ -57,6 +57,8 @@ define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 	[ -d "$(RATAN_TEL_SRC)" ] || { echo "ERROR: telemetry src missing"; exit 1; }
 	$(CP) $(RATAN_TEL_SRC)/ratan_telemetryd.c $(PKG_BUILD_DIR)/
+	$(CP) $(RATAN_TEL_SRC)/discover.c         $(PKG_BUILD_DIR)/
+	$(CP) $(RATAN_TEL_SRC)/discover.h         $(PKG_BUILD_DIR)/
 	$(CP) $(RATAN_TEL_SRC)/schema.sql         $(PKG_BUILD_DIR)/
 	$(CP) $(RATAN_PROTO_H)                    $(PKG_BUILD_DIR)/ratan_proto.h
 endef
@@ -67,9 +69,11 @@ endef
 define Build/Compile
 	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_CPPFLAGS) $(TARGET_LDFLAGS) \
 		-Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -Wno-array-bounds \
+		-pthread \
 		-I$(PKG_BUILD_DIR) \
 		-o $(PKG_BUILD_DIR)/ratan_telemetryd \
 		$(PKG_BUILD_DIR)/ratan_telemetryd.c \
+		$(PKG_BUILD_DIR)/discover.c \
 		-lsqlite3
 endef
 
