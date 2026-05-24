@@ -53,6 +53,8 @@
 
 #include "../prober/ratan_proto.h"
 #include "discover.h"
+#include "flowtrack.h"
+#include "mos.h"
 
 #define DEFAULT_DB_PATH       "/var/lib/ratan/telemetry.db"
 #define DEFAULT_SOCK_PATH     "/run/ratan/telemetry.sock"
@@ -60,6 +62,7 @@
 #define DEFAULT_HTTP_PORT     9180
 #define DEFAULT_SCHEMA_PATH   "/usr/share/ratan/schema.sql"
 #define DEFAULT_LEASE_FILE    "/tmp/dhcp.leases"
+#define DEFAULT_NDPI_CATS     "/etc/ratan/ndpi-categories.conf"
 
 #define MAX_HTTP_CLIENTS      32
 #define HTTP_REQ_MAX          8192
@@ -100,6 +103,8 @@ static struct {
 	atomic_ullong state_transitions_total;
 	atomic_ullong weight_changes_total;
 	atomic_ullong discovery_events_total;
+	atomic_ullong flow_events_total;
+	atomic_ullong mos_events_total;
 	atomic_ullong http_requests_total;
 	atomic_ullong sse_clients_current;
 	atomic_ullong sessions_started_total;
@@ -115,6 +120,8 @@ static sqlite3_stmt *g_st_ins_state;
 static sqlite3_stmt *g_st_ins_weight;
 static sqlite3_stmt *g_st_ins_inject;
 static sqlite3_stmt *g_st_ins_discovery;
+static sqlite3_stmt *g_st_ins_flow;
+static sqlite3_stmt *g_st_ins_mos;
 static sqlite3_stmt *g_st_ins_session;
 static sqlite3_stmt *g_st_get_session;
 static sqlite3_stmt *g_st_stop_session;
@@ -177,6 +184,12 @@ static int db_init(const char *path, const char *schema_path)
 
 		"INSERT INTO discovery(ts_ns,kind,detail) VALUES (?,?,?)",
 
+		"INSERT INTO flows(ts_ns,event,five_tuple,category,mark) "
+		"VALUES (?,?,?,?,?)",
+
+		"INSERT INTO mos(ts_ns,flow_id,mos,rtt_ms,loss_pct,jitter_ms,session_id) "
+		"VALUES (?,?,?,?,?,?,?)",
+
 		"INSERT INTO sessions(name,started_ns,metadata) VALUES (?,?,?)",
 		"SELECT id,name,started_ns,ended_ns,status,metadata,summary FROM sessions WHERE id=?",
 		"UPDATE sessions SET ended_ns=?, status=?, summary=? WHERE id=?",
@@ -184,7 +197,8 @@ static int db_init(const char *path, const char *schema_path)
 	};
 	sqlite3_stmt **slots[] = {
 		&g_st_ins_sample, &g_st_ins_state, &g_st_ins_weight,
-		&g_st_ins_inject, &g_st_ins_discovery,
+		&g_st_ins_inject, &g_st_ins_discovery, &g_st_ins_flow,
+		&g_st_ins_mos,
 		&g_st_ins_session, &g_st_get_session, &g_st_stop_session,
 		&g_st_active_session,
 	};
@@ -385,6 +399,82 @@ static void on_discovery(const struct ratan_discovery_event *e)
 	if (n > 0) sse_broadcast(j, (size_t)n);
 }
 
+static void on_mos(const struct ratan_mos_event *e)
+{
+	atomic_fetch_add(&g_metrics.mos_events_total, 1);
+
+	double rtt_ms    = e->rtt_us / 1000.0;
+	double loss_pct  = e->loss_ppm / 10000.0;
+	double jitter_ms = e->jitter_us / 1000.0;
+
+	sqlite3_reset(g_st_ins_mos);
+	sqlite3_bind_int64 (g_st_ins_mos, 1, (sqlite3_int64)e->ts_ns);
+	sqlite3_bind_text  (g_st_ins_mos, 2, e->flow_id, -1, SQLITE_TRANSIENT);
+	sqlite3_bind_double(g_st_ins_mos, 3, e->mos);
+	sqlite3_bind_double(g_st_ins_mos, 4, rtt_ms);
+	sqlite3_bind_double(g_st_ins_mos, 5, loss_pct);
+	sqlite3_bind_double(g_st_ins_mos, 6, jitter_ms);
+	int sid = current_session_or_zero();
+	if (sid) sqlite3_bind_int(g_st_ins_mos, 7, sid);
+	else     sqlite3_bind_null(g_st_ins_mos, 7);
+	if (sqlite3_step(g_st_ins_mos) != SQLITE_DONE)
+		LOGW("ins_mos: %s", sqlite3_errmsg(g_db));
+
+	char j[512], esc_fid[140], esc_cat[80];
+	json_escape(esc_fid, sizeof(esc_fid), e->flow_id);
+	json_escape(esc_cat, sizeof(esc_cat), e->category);
+	int n = snprintf(j, sizeof(j),
+		"{\"kind\":\"mos\",\"ts_ns\":%llu,\"flow\":\"%s\",\"category\":\"%s\","
+		"\"wan\":%u,\"mos\":%.3f,\"r\":%.2f,"
+		"\"rtt_ms\":%.2f,\"loss_pct\":%.4f,\"jitter_ms\":%.2f}",
+		(unsigned long long)e->ts_ns, esc_fid, esc_cat, e->wan_id,
+		(double)e->mos, (double)e->r_factor,
+		rtt_ms, loss_pct, jitter_ms);
+	if (n > 0) sse_broadcast(j, (size_t)n);
+}
+
+static void on_flow(const struct ratan_flow_event *e)
+{
+	atomic_fetch_add(&g_metrics.flow_events_total, 1);
+
+	const char *event_str =
+		e->event == RATAN_FLOW_START  ? "flow_start" :
+		e->event == RATAN_FLOW_END    ? "flow_end"   :
+		e->event == RATAN_FLOW_UPDATE ? "flow_update" : "flow_?";
+	const char *proto_str =
+		e->proto == 6   ? "tcp"   :
+		e->proto == 17  ? "udp"   :
+		e->proto == 1   ? "icmp"  :
+		e->proto == 58  ? "icmp6" :
+		e->proto == 132 ? "sctp"  : "ip";
+
+	char five[160];
+	snprintf(five, sizeof(five), "%s:%s->%s", proto_str, e->src, e->dst);
+
+	sqlite3_reset(g_st_ins_flow);
+	sqlite3_bind_int64(g_st_ins_flow, 1, (sqlite3_int64)e->ts_ns);
+	sqlite3_bind_text (g_st_ins_flow, 2, event_str,    -1, SQLITE_TRANSIENT);
+	sqlite3_bind_text (g_st_ins_flow, 3, five,         -1, SQLITE_TRANSIENT);
+	sqlite3_bind_text (g_st_ins_flow, 4, e->category,  -1, SQLITE_TRANSIENT);
+	sqlite3_bind_int  (g_st_ins_flow, 5, (int)e->mark);
+	if (sqlite3_step(g_st_ins_flow) != SQLITE_DONE)
+		LOGW("ins_flow: %s", sqlite3_errmsg(g_db));
+
+	char j[512], esc_five[200], esc_cat[80];
+	json_escape(esc_five, sizeof(esc_five), five);
+	json_escape(esc_cat,  sizeof(esc_cat),  e->category);
+	int n = snprintf(j, sizeof(j),
+		"{\"kind\":\"flow\",\"ts_ns\":%llu,\"event\":\"%s\","
+		"\"five_tuple\":\"%s\",\"mark\":%u,\"category\":\"%s\","
+		"\"bytes_orig\":%llu,\"bytes_reply\":%llu,\"family\":%u}",
+		(unsigned long long)e->ts_ns, event_str, esc_five,
+		e->mark, esc_cat,
+		(unsigned long long)e->bytes_orig,
+		(unsigned long long)e->bytes_reply,
+		e->family);
+	if (n > 0) sse_broadcast(j, (size_t)n);
+}
+
 static void on_inject(const struct ratan_inject_event *e)
 {
 	/* The injects table has session_id NOT NULL with FK CASCADE -- writing
@@ -443,8 +533,12 @@ static void ingest(const uint8_t *buf, size_t n)
 	case RATAN_EVENT_DISCOVERY:
 		if (h->len == sizeof(struct ratan_discovery_event)) on_discovery(p);
 		break;
-	/* RATAN_EVENT_FLOW / MOS: arriving in subsequent Step 4b commits
-	 * (CTNETLINK subscriber + MOS computer). */
+	case RATAN_EVENT_FLOW:
+		if (h->len == sizeof(struct ratan_flow_event)) on_flow(p);
+		break;
+	case RATAN_EVENT_MOS:
+		if (h->len == sizeof(struct ratan_mos_event)) on_mos(p);
+		break;
 	default:
 		break;
 	}
@@ -524,6 +618,12 @@ static void route_metrics(int fd)
 "# HELP ratan_discovery_events_total Discovery events ingested (netlink + inotify)\n"
 "# TYPE ratan_discovery_events_total counter\n"
 "ratan_discovery_events_total %llu\n"
+"# HELP ratan_flow_events_total Conntrack flow events ingested (CTNETLINK)\n"
+"# TYPE ratan_flow_events_total counter\n"
+"ratan_flow_events_total %llu\n"
+"# HELP ratan_mos_events_total Per-second MOS samples computed for active call flows\n"
+"# TYPE ratan_mos_events_total counter\n"
+"ratan_mos_events_total %llu\n"
 "# HELP ratan_http_requests_total HTTP requests handled\n"
 "# TYPE ratan_http_requests_total counter\n"
 "ratan_http_requests_total %llu\n"
@@ -545,6 +645,8 @@ static void route_metrics(int fd)
 		(unsigned long long)atomic_load(&g_metrics.state_transitions_total),
 		(unsigned long long)atomic_load(&g_metrics.weight_changes_total),
 		(unsigned long long)atomic_load(&g_metrics.discovery_events_total),
+		(unsigned long long)atomic_load(&g_metrics.flow_events_total),
+		(unsigned long long)atomic_load(&g_metrics.mos_events_total),
 		(unsigned long long)atomic_load(&g_metrics.http_requests_total),
 		(unsigned long long)atomic_load(&g_metrics.sse_clients_current),
 		(unsigned long long)atomic_load(&g_metrics.sessions_started_total),
@@ -948,6 +1050,89 @@ static void route_discovery_list(int fd, int limit)
 	free(out);
 }
 
+/* GET /mos -- N most recent MOS samples. Pair with /stream for live. */
+static void route_mos_list(int fd, int limit)
+{
+	if (limit <= 0 || limit > 2000) limit = 200;
+	sqlite3_stmt *st;
+	const char *q = "SELECT ts_ns,flow_id,mos,rtt_ms,loss_pct,jitter_ms,session_id "
+			"FROM mos ORDER BY ts_ns DESC LIMIT ?";
+	if (sqlite3_prepare_v2(g_db, q, -1, &st, NULL) != SQLITE_OK) {
+		send_status(fd, 500, "text/plain", "", 0); return;
+	}
+	sqlite3_bind_int(st, 1, limit);
+
+	char *out = malloc(65536);
+	if (!out) { sqlite3_finalize(st); send_status(fd, 500, "text/plain", "", 0); return; }
+	size_t len = 0;
+	len += snprintf(out + len, 65536 - len, "{\"samples\":[");
+	bool first = true;
+	while (sqlite3_step(st) == SQLITE_ROW) {
+		if (65536 - len < 256) break;
+		if (!first) len += snprintf(out + len, 65536 - len, ",");
+		first = false;
+		char esc_fid[160];
+		json_escape(esc_fid, sizeof(esc_fid),
+			(const char *)sqlite3_column_text(st, 1));
+		int sid = sqlite3_column_type(st, 6) == SQLITE_NULL ? 0
+			  : sqlite3_column_int(st, 6);
+		len += snprintf(out + len, 65536 - len,
+			"{\"ts_ns\":%lld,\"flow\":\"%s\",\"mos\":%.3f,"
+			"\"rtt_ms\":%.2f,\"loss_pct\":%.4f,\"jitter_ms\":%.2f,"
+			"\"session_id\":%d}",
+			(long long)sqlite3_column_int64(st, 0), esc_fid,
+			sqlite3_column_double(st, 2),
+			sqlite3_column_double(st, 3),
+			sqlite3_column_double(st, 4),
+			sqlite3_column_double(st, 5), sid);
+	}
+	len += snprintf(out + len, 65536 - len, "]}");
+	sqlite3_finalize(st);
+	send_status(fd, 200, "application/json", out, len);
+	free(out);
+}
+
+/* GET /flows -- N most recent flow events. Pair this with /stream for
+ * the UI's live flows table. */
+static void route_flows_list(int fd, int limit)
+{
+	if (limit <= 0 || limit > 2000) limit = 200;
+	sqlite3_stmt *st;
+	const char *q = "SELECT ts_ns,event,five_tuple,category,mark FROM flows "
+			"ORDER BY ts_ns DESC LIMIT ?";
+	if (sqlite3_prepare_v2(g_db, q, -1, &st, NULL) != SQLITE_OK) {
+		send_status(fd, 500, "text/plain", "", 0); return;
+	}
+	sqlite3_bind_int(st, 1, limit);
+
+	char *out = malloc(65536);
+	if (!out) { sqlite3_finalize(st); send_status(fd, 500, "text/plain", "", 0); return; }
+	size_t len = 0;
+	len += snprintf(out + len, 65536 - len, "{\"flows\":[");
+	bool first = true;
+	while (sqlite3_step(st) == SQLITE_ROW) {
+		if (65536 - len < 512) break;
+		if (!first) len += snprintf(out + len, 65536 - len, ",");
+		first = false;
+		char esc_ev[24], esc_ft[200], esc_cat[80];
+		json_escape(esc_ev,  sizeof(esc_ev),
+			(const char *)sqlite3_column_text(st, 1));
+		json_escape(esc_ft,  sizeof(esc_ft),
+			(const char *)sqlite3_column_text(st, 2));
+		json_escape(esc_cat, sizeof(esc_cat),
+			(const char *)sqlite3_column_text(st, 3));
+		len += snprintf(out + len, 65536 - len,
+			"{\"ts_ns\":%lld,\"event\":\"%s\",\"five_tuple\":\"%s\","
+			"\"category\":\"%s\",\"mark\":%d}",
+			(long long)sqlite3_column_int64(st, 0),
+			esc_ev, esc_ft, esc_cat, sqlite3_column_int(st, 4));
+	}
+	len += snprintf(out + len, 65536 - len, "]}");
+	sqlite3_finalize(st);
+	send_status(fd, 200, "application/json", out, len);
+	free(out);
+}
+
 static void route_sessions_delete(int fd, int id)
 {
 	char sql[128];
@@ -1033,14 +1218,26 @@ static void http_handle(int idx)
 	}
 	if (!strcmp(method, "GET") &&
 	    (!strcmp(path, "/discovery") || !strncmp(path, "/discovery?", 11))) {
-		/* parse ?limit=N if present */
 		int limit = 200;
 		const char *q = strchr(path, '?');
-		if (q) {
-			const char *l = strstr(q, "limit=");
-			if (l) limit = atoi(l + 6);
-		}
+		if (q) { const char *l = strstr(q, "limit="); if (l) limit = atoi(l + 6); }
 		route_discovery_list(c->fd, limit);
+		http_drop(idx); return;
+	}
+	if (!strcmp(method, "GET") &&
+	    (!strcmp(path, "/flows") || !strncmp(path, "/flows?", 7))) {
+		int limit = 200;
+		const char *q = strchr(path, '?');
+		if (q) { const char *l = strstr(q, "limit="); if (l) limit = atoi(l + 6); }
+		route_flows_list(c->fd, limit);
+		http_drop(idx); return;
+	}
+	if (!strcmp(method, "GET") &&
+	    (!strcmp(path, "/mos") || !strncmp(path, "/mos?", 5))) {
+		int limit = 200;
+		const char *q = strchr(path, '?');
+		if (q) { const char *l = strstr(q, "limit="); if (l) limit = atoi(l + 6); }
+		route_mos_list(c->fd, limit);
 		http_drop(idx); return;
 	}
 	if (!strcmp(method, "POST") && !strcmp(path, "/sessions")) {
@@ -1133,9 +1330,15 @@ static void usage(const char *me)
 "  --http-port N      %d by default\n"
 "  --lease-file PATH  %s by default (dnsmasq leases for discover thread)\n"
 "  --no-discover      don't spawn the netlink+inotify discovery thread\n"
+"  --ndpi-cats PATH   %s by default (nDPI mark->category map)\n"
+"  --no-flowtrack     don't spawn the CTNETLINK flow tracker thread\n"
+"  --no-mos           don't spawn the MOS computer thread\n"
+"  --mos-category G   substring match for which flows get MOS scored\n"
+"                     (default \"VideoCall/\" -- matches Teams/Zoom/Meet)\n"
 "  --foreground\n",
 		me, DEFAULT_DB_PATH, DEFAULT_SCHEMA_PATH, DEFAULT_SOCK_PATH,
-		DEFAULT_HTTP_HOST, DEFAULT_HTTP_PORT, DEFAULT_LEASE_FILE);
+		DEFAULT_HTTP_HOST, DEFAULT_HTTP_PORT,
+		DEFAULT_LEASE_FILE, DEFAULT_NDPI_CATS);
 }
 
 int main(int argc, char **argv)
@@ -1145,20 +1348,29 @@ int main(int argc, char **argv)
 	const char *schema_path = DEFAULT_SCHEMA_PATH;
 	const char *http_host   = DEFAULT_HTTP_HOST;
 	const char *lease_file  = DEFAULT_LEASE_FILE;
+	const char *ndpi_cats   = DEFAULT_NDPI_CATS;
 	uint16_t    http_port   = DEFAULT_HTTP_PORT;
-	bool        run_discover = true;
+	bool        run_discover  = true;
+	bool        run_flowtrack = true;
+	bool        run_mos       = true;
+	const char *mos_category  = "VideoCall/";
 
-	enum { OPT_LEASE = 256, OPT_NODISC };
+	enum { OPT_LEASE = 256, OPT_NODISC, OPT_NDPI, OPT_NOFLOW,
+	       OPT_NOMOS, OPT_MOSCAT };
 	static const struct option opts[] = {
-		{ "db",          required_argument, 0, 'd' },
-		{ "schema",      required_argument, 0, 'C' },
-		{ "sock",        required_argument, 0, 's' },
-		{ "http-host",   required_argument, 0, 'H' },
-		{ "http-port",   required_argument, 0, 'P' },
-		{ "lease-file",  required_argument, 0, OPT_LEASE },
-		{ "no-discover", no_argument,       0, OPT_NODISC },
-		{ "foreground",  no_argument,       0, 'f' },
-		{ "help",        no_argument,       0, 'h' },
+		{ "db",            required_argument, 0, 'd' },
+		{ "schema",        required_argument, 0, 'C' },
+		{ "sock",          required_argument, 0, 's' },
+		{ "http-host",     required_argument, 0, 'H' },
+		{ "http-port",     required_argument, 0, 'P' },
+		{ "lease-file",    required_argument, 0, OPT_LEASE },
+		{ "no-discover",   no_argument,       0, OPT_NODISC },
+		{ "ndpi-cats",     required_argument, 0, OPT_NDPI },
+		{ "no-flowtrack",  no_argument,       0, OPT_NOFLOW },
+		{ "no-mos",        no_argument,       0, OPT_NOMOS },
+		{ "mos-category",  required_argument, 0, OPT_MOSCAT },
+		{ "foreground",    no_argument,       0, 'f' },
+		{ "help",          no_argument,       0, 'h' },
 		{ 0 }
 	};
 	int c;
@@ -1169,8 +1381,12 @@ int main(int argc, char **argv)
 		case 's': sock_path = optarg; break;
 		case 'H': http_host = optarg; break;
 		case 'P': http_port = (uint16_t)atoi(optarg); break;
-		case OPT_LEASE: lease_file = optarg; break;
+		case OPT_LEASE:  lease_file = optarg; break;
 		case OPT_NODISC: run_discover = false; break;
+		case OPT_NDPI:   ndpi_cats = optarg; break;
+		case OPT_NOFLOW: run_flowtrack = false; break;
+		case OPT_NOMOS:  run_mos = false; break;
+		case OPT_MOSCAT: mos_category = optarg; break;
 		case 'f': g_foreground = true; break;
 		case 'h': default: usage(argv[0]); return c == 'h' ? 0 : 1;
 		}
@@ -1204,6 +1420,16 @@ int main(int argc, char **argv)
 	if (run_discover) {
 		if (discover_start(sock_path, lease_file, &g_stop, &discover_tid) < 0)
 			LOGW("discover thread failed to start (continuing without it)");
+	}
+	pthread_t flowtrack_tid = 0;
+	if (run_flowtrack) {
+		if (flowtrack_start(sock_path, ndpi_cats, &g_stop, &flowtrack_tid) < 0)
+			LOGW("flowtrack thread failed to start (CAP_NET_ADMIN + nf_conntrack required); continuing without it");
+	}
+	pthread_t mos_tid = 0;
+	if (run_mos) {
+		if (mos_start(sock_path, db_path, mos_category, &g_stop, &mos_tid) < 0)
+			LOGW("mos thread failed to start; continuing without it");
 	}
 
 	while (!g_stop) {
@@ -1261,7 +1487,9 @@ int main(int argc, char **argv)
 
 	LOGI("shutting down");
 	g_stop = 1;
-	if (discover_tid) pthread_join(discover_tid, NULL);
+	if (discover_tid)  pthread_join(discover_tid, NULL);
+	if (flowtrack_tid) pthread_join(flowtrack_tid, NULL);
+	if (mos_tid)       pthread_join(mos_tid, NULL);
 	close(sig_fd); close(http_fd); close(tel_fd);
 	for (int i = 0; i < g_http_n; i++) close(g_http[i].fd);
 	for (int i = 0; i < g_sse_n; i++) close(g_sse[i].fd);
@@ -1270,6 +1498,8 @@ int main(int argc, char **argv)
 	sqlite3_finalize(g_st_ins_weight);
 	sqlite3_finalize(g_st_ins_inject);
 	sqlite3_finalize(g_st_ins_discovery);
+	sqlite3_finalize(g_st_ins_flow);
+	sqlite3_finalize(g_st_ins_mos);
 	sqlite3_finalize(g_st_ins_session);
 	sqlite3_finalize(g_st_get_session);
 	sqlite3_finalize(g_st_stop_session);

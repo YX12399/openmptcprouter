@@ -5,15 +5,18 @@
 #   apt install build-essential libsqlite3-dev
 
 CC      ?= cc
-CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -Wno-array-bounds
+CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -Wno-array-bounds -Wno-stringop-truncation
 PREFIX  ?= /usr/local
 DESTDIR ?=
 
 all: ratan_telemetryd
 
-ratan_telemetryd: ratan_telemetryd.c discover.c discover.h ../prober/ratan_proto.h
+ratan_telemetryd: ratan_telemetryd.c discover.c discover.h \
+                  flowtrack.c flowtrack.h mos.c mos.h \
+                  ../prober/ratan_proto.h
 	$(CC) $(CFLAGS) -I. -I../prober -pthread \
-	    -o $@ ratan_telemetryd.c discover.c -lsqlite3
+	    -o $@ ratan_telemetryd.c discover.c flowtrack.c mos.c \
+	    -lsqlite3 -lm
 
 install: all
 	install -d $(DESTDIR)$(PREFIX)/sbin $(DESTDIR)$(PREFIX)/share/ratan

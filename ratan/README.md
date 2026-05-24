@@ -24,7 +24,7 @@ ratan/
 └── scripts/                        build wrappers                                  [STEP 10]
 ```
 
-## Current state — Steps 1–4b (harness + discovery slices) of 17
+## Current state — Step 4 COMPLETE (steps 1–4 of 17)
 
 Shipped (Step 1, scheduler source):
 - `src/sched/ratan_sched.bpf.c` — BPF struct_ops MPTCP scheduler. Default behavior = highest weight in a pinned `ratan_path_weights` map wins; falls back to first-active subflow if weights are all zero.
@@ -88,7 +88,50 @@ Shipped (Step 4b, discovery slice — the "what's connected right now" feed):
 
 **Verified locally**: snapshot fires on startup (5 events on a minimal container: 2 ifaces + 2 addrs + 1 neighbor with correct iface names / MTU / flags / IP family / MAC formatting), inotify catches lease changes and correctly emits MAC-keyed diffs (no false adds when an unrelated line changes), SSE broadcast in real time, `/discovery` endpoint returns the snapshot for UI consumption.
 
-Deferred to subsequent Step 4b commits: hostapd UBUS subscriber (WiFi assoc/disassoc, OMR-only, needs libubus), MPTCP genetlink subscriber (`MPTCP_PM_CMD_*` path notifications), per-flow tracker (CTNETLINK + nDPI), MOS computer. Then: classifier (Step 5), predictor (Step 6), QoS (Step 8), handover learner (Step 9), CLI (Step 10), LuCI UI (Step 11), relay (Step 12), Vercel dashboard (Step 13).
+Shipped (Step 4b, flowtrack slice — per-flow visibility):
+- `src/prober/ratan_proto.h` — added `struct ratan_flow_event` (168 bytes).
+- `src/telemetry/flowtrack.{c,h}` — in-process pthread subscribing to CTNETLINK NEW/DESTROY groups. Parses nested netlink attribute trees (`CTA_TUPLE_ORIG > CTA_TUPLE_IP > CTA_IP_V4_SRC` etc., with full bounds checking on every nested attr length). Extracts 5-tuple + conntrack mark + counters. **nDPI category mapping** loaded from `/etc/ratan/ndpi-categories.conf` (one `<int>  <name>` per line; `#` comments) — the mark→category-name lookup is decoupled from kernel-side ndpi-netfilter encoding so it works whatever convention OMR's nDPI integration uses. Bounded 4096-entry flow table with LRU eviction. **Containers can't run flowtrack** (needs `CAP_NET_ADMIN` + `nf_conntrack` loaded); on failure the daemon logs a warning and continues without it.
+- `src/telemetry/ratan_telemetryd.c` — handles `RATAN_EVENT_FLOW`: persists to `flows` table, broadcasts via SSE. `GET /flows?limit=N` endpoint. New metric `ratan_flow_events_total`. New CLI flags `--ndpi-cats`, `--no-flowtrack`.
+
+Shipped (Step 4b, MOS slice — the "did the call survive?" quantification):
+- `src/prober/ratan_proto.h` — added `struct ratan_mos_event` (144 bytes).
+- `src/telemetry/mos.{c,h}` — in-process pthread, 1Hz tick. Queries SQLite for active VideoCall/* flows (configurable via `--mos-category`), aggregates last-1s prober samples per WAN, picks the WAN with lowest avg RTT as the call's likely path (documented heuristic), applies the E-model R-factor → MOS formula (`Id=0.024·lat + 0.11·max(lat-177.3,0)`, `Ie=loss%·30`, `R=93.2-Id-Ie`, MOS clamped to [1.0, 4.5]). Emits `RATAN_EVENT_MOS` envelopes back through the telemetry socket — symmetric with every other event. Opens SQLite **read-only** since the daemon owns writes.
+- `src/telemetry/ratan_telemetryd.c` — handles `RATAN_EVENT_MOS`: persists to `mos` table with rtt_ms/loss_pct/jitter_ms (converted from prober's microsecond/ppm units), broadcasts via SSE with the full R-factor + per-component breakdown. `GET /mos?limit=N` endpoint. New metric `ratan_mos_events_total`. New CLI flags `--no-mos`, `--mos-category`.
+
+**Verified end-to-end locally**: fed 120 prober samples on two WANs (25ms vs 60ms) + one `VideoCall/Teams` flow_start; MOS thread correctly selected the 25ms WAN, computed MOS = **4.397** (matches offline reference calculation), persisted to `mos` table, returned via `/mos` endpoint. Boundary tests confirmed MOS clamps at 4.5/1.0 across the realistic input range.
+
+### Step 4 complete. What we can do today:
+
+```sh
+# build everything in src/telemetry/
+sudo apt install -y build-essential libsqlite3-dev python3-yaml
+cd ratan/src/telemetry && make
+
+# run the full pipeline locally (no kernel changes needed)
+mkdir -p /tmp/ratan
+./ratan_telemetryd --db /tmp/ratan/t.db --schema ./schema.sql \
+    --sock /tmp/ratan/t.sock --http-port 9180 \
+    --no-discover --no-flowtrack          # disable kernel-side bits on dev box
+    --foreground &
+
+# record a test session with synchronized markers (Step 4b/harness)
+ratan/src/test/ratan-test --port 9180 --sock /tmp/ratan/t.sock list-recipes
+ratan/src/test/ratan-test --port 9180 --sock /tmp/ratan/t.sock record \
+    --name "first_test" --duration 3 --inject "at:1s mark:hello"
+
+# UI-side endpoints ready for any client (LuCI, Vercel, curl):
+curl http://127.0.0.1:9180/sessions       # list
+curl http://127.0.0.1:9180/discovery      # WANs/IPs/LAN neighbors
+curl http://127.0.0.1:9180/flows          # active TCP/UDP flows w/ nDPI category
+curl http://127.0.0.1:9180/mos            # per-second MOS samples
+curl -N http://127.0.0.1:9180/stream      # live SSE
+curl http://127.0.0.1:9180/metrics        # Prometheus
+curl -O -J http://127.0.0.1:9180/sessions/1/download   # downloadable JSON
+```
+
+Deferred (later commits, smaller priority): hostapd UBUS subscriber for WiFi assoc events (libubus, OMR-only), MPTCP genetlink subscriber for subflow lifecycle events. Both useful but not blocking for the demo.
+
+Next: classifier (Step 5), predictor (Step 6), QoS (Step 8), handover learner (Step 9), CLI (Step 10), LuCI UI (Step 11), relay (Step 12), Vercel dashboard (Step 13).
 
 ## Building an actual OMR firmware image (Step 2)
 

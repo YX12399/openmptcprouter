@@ -119,4 +119,62 @@ struct ratan_discovery_event {
 	char     detail[104];
 } __attribute__((packed));
 
+/* Flow-event payload (RATAN_EVENT_FLOW). Written by the in-process
+ * flowtrack thread on CTNETLINK NEW/DESTROY events. 168 bytes.
+ *
+ *   event:     RATAN_FLOW_START / _END / _UPDATE
+ *   proto:     IP protocol (6=TCP, 17=UDP)
+ *   family:    4 or 6
+ *   mark:      conntrack mark; by convention OMR's ndpi-netfilter writes
+ *              the nDPI category id here. The mapping mark->human-readable
+ *              category name is loaded from /etc/ratan/ndpi-categories.conf
+ *              at startup (one "<id>  <name>" per line; '#' comments).
+ *   bytes_*:   counters from CTA_COUNTERS_ORIG/_REPLY when present (0 else).
+ *   src/dst:   "ip:port" or "[ipv6]:port" strings (UI-friendly).
+ *   category:  resolved name or "" if mark==0 or unknown.
+ */
+struct ratan_flow_event {
+	uint64_t ts_ns;
+	uint8_t  event;
+	uint8_t  proto;
+	uint8_t  family;
+	uint8_t  _pad;
+	uint32_t mark;
+	uint64_t bytes_orig;
+	uint64_t bytes_reply;
+	char     src[48];
+	char     dst[48];
+	char     category[40];
+} __attribute__((packed));
+
+#define RATAN_FLOW_START   0
+#define RATAN_FLOW_END     1
+#define RATAN_FLOW_UPDATE  2   /* reserved; Step 4b doesn't emit these */
+
+/* MOS payload (RATAN_EVENT_MOS). Emitted by the in-process mos thread
+ * once per second per active VideoCall/* flow. 144 bytes.
+ *
+ * Computation: E-model R-factor -> MOS (ITU-T G.107 simplified for Opus).
+ *   Id = 0.024*lat_ms + 0.11*max(lat_ms - 177.3, 0)
+ *   Ie = loss_pct * 30        (Opus codec sensitivity)
+ *   R  = 93.2 - Id - Ie
+ *   MOS clamped to [1.0, 4.5]
+ *
+ * The wan_id is the WAN currently chosen as "best" by lowest avg RTT
+ * over the last 1s -- a heuristic since UDP video doesn't expose which
+ * subflow it actually used. Document as approximation.
+ */
+struct ratan_mos_event {
+	uint64_t ts_ns;
+	char     flow_id[64];     /* five_tuple */
+	char     category[40];
+	uint8_t  wan_id;
+	uint8_t  _pad[3];
+	uint32_t rtt_us;
+	uint32_t loss_ppm;        /* parts-per-million */
+	uint32_t jitter_us;
+	float    r_factor;
+	float    mos;             /* 1.0 .. 4.5 */
+} __attribute__((packed));
+
 #endif /* RATAN_PROTO_H */

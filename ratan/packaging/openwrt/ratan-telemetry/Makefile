@@ -59,6 +59,10 @@ define Build/Prepare
 	$(CP) $(RATAN_TEL_SRC)/ratan_telemetryd.c $(PKG_BUILD_DIR)/
 	$(CP) $(RATAN_TEL_SRC)/discover.c         $(PKG_BUILD_DIR)/
 	$(CP) $(RATAN_TEL_SRC)/discover.h         $(PKG_BUILD_DIR)/
+	$(CP) $(RATAN_TEL_SRC)/flowtrack.c        $(PKG_BUILD_DIR)/
+	$(CP) $(RATAN_TEL_SRC)/flowtrack.h        $(PKG_BUILD_DIR)/
+	$(CP) $(RATAN_TEL_SRC)/mos.c              $(PKG_BUILD_DIR)/
+	$(CP) $(RATAN_TEL_SRC)/mos.h              $(PKG_BUILD_DIR)/
 	$(CP) $(RATAN_TEL_SRC)/schema.sql         $(PKG_BUILD_DIR)/
 	$(CP) $(RATAN_PROTO_H)                    $(PKG_BUILD_DIR)/ratan_proto.h
 endef
@@ -68,13 +72,16 @@ endef
 
 define Build/Compile
 	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_CPPFLAGS) $(TARGET_LDFLAGS) \
-		-Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -Wno-array-bounds \
+		-Wall -Wextra -Wno-unused-parameter -Wno-format-truncation \
+		-Wno-array-bounds -Wno-stringop-truncation \
 		-pthread \
 		-I$(PKG_BUILD_DIR) \
 		-o $(PKG_BUILD_DIR)/ratan_telemetryd \
 		$(PKG_BUILD_DIR)/ratan_telemetryd.c \
 		$(PKG_BUILD_DIR)/discover.c \
-		-lsqlite3
+		$(PKG_BUILD_DIR)/flowtrack.c \
+		$(PKG_BUILD_DIR)/mos.c \
+		-lsqlite3 -lm
 endef
 
 define Package/ratan-telemetry/install
