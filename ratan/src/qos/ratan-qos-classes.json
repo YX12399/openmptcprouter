@@ -1,0 +1,44 @@
+{
+  "_comment": "Category-pattern -> traffic-class map for ratan-qos. Patterns match the nDPI category strings emitted by flowtrack (e.g. 'VideoCall/Teams'). Pattern matching is simple prefix: 'VideoCall/' matches everything starting with VideoCall/.  The 'mark' field is the integer set in ct->mark and matched by nft.",
+
+  "classes": [
+    {
+      "id": 1,
+      "mark": 1,
+      "name": "realtime",
+      "description": "Latency-critical real-time traffic (video calls, VoIP).  Strict-priority + guaranteed bandwidth floor.",
+      "patterns": [
+        "VideoCall/",
+        "VoIP/",
+        "Audio/",
+        "RealTimeChat/"
+      ]
+    },
+    {
+      "id": 2,
+      "mark": 2,
+      "name": "bulk",
+      "description": "Best-effort web / streaming / generic traffic.  Gets whatever bandwidth realtime isn't using.",
+      "patterns": [
+        "Web/",
+        "Streaming/",
+        "DNS",
+        "HTTP",
+        "TLS",
+        "QUIC"
+      ]
+    },
+    {
+      "id": 3,
+      "mark": 3,
+      "name": "background",
+      "description": "Backups, OS updates, P2P -- gets only leftovers, ceiling capped.",
+      "patterns": [
+        "OS/",
+        "FileTransfer/",
+        "BitTorrent/",
+        "Backup/"
+      ]
+    }
+  ]
+}

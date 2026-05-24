@@ -29,6 +29,7 @@ define Package/ratan-full
     +ratan-telemetry \
     +ratan-test \
     +ratan-classifier \
+    +ratan-qos \
     +luci-app-ratan
   # Future components will be added here as they ship:
   #   +ratan-classifier  (Step 5)
@@ -46,7 +47,7 @@ define Package/ratan-full/description
   sub-200ms failover, QoS, telemetry, LuCI UI).
 
   Currently includes: ratan-sched, ratan-prober, ratan-telemetry,
-  ratan-test, ratan-classifier, luci-app-ratan.
+  ratan-test, ratan-classifier, ratan-qos, luci-app-ratan.
 endef
 
 define Build/Prepare

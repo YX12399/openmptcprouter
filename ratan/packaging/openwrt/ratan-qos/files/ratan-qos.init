@@ -1,0 +1,45 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0
+#
+# procd init for ratan-qos. Applies the HTB+nft framework on boot;
+# reapplies on reload. Stops cleanly on stop.
+
+START=92      # after most network services; QoS should be the last layer
+STOP=11
+USE_PROCD=1
+
+start_service() {
+	local enabled
+	config_load 'ratan-qos'
+	config_get_bool enabled main enabled 1
+	[ "$enabled" = "0" ] && {
+		logger -t ratan-qos "disabled in /etc/config/ratan-qos"
+		return 0
+	}
+
+	# apply is idempotent; runs as a one-shot
+	procd_open_instance
+	procd_set_param command /usr/sbin/ratan-qos-apply
+	procd_set_param respawn 0 0 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file /etc/config/ratan-qos
+	procd_close_instance
+}
+
+stop_service() {
+	/usr/sbin/ratan-qos-stop
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "ratan-qos"
+	# Re-apply when an iface comes up (so a WAN appearing after boot
+	# still gets shaped).
+	procd_add_reload_interface_trigger "wan0"
+	procd_add_reload_interface_trigger "wan1"
+}

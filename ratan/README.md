@@ -24,7 +24,7 @@ ratan/
 └── scripts/                        build wrappers                                  [STEP 10]
 ```
 
-## Current state — Steps 1–5, 9, 11 (design integration) of 17
+## Current state — Steps 1–5, 8a, 9, 11 of 17
 
 > **RATAN coexists with LuCI.** The standard LuCI admin (wizards, WAN/LAN
 > config, firewall, system status, syslog, backup, OpenMPTCProuter status,
@@ -133,6 +133,46 @@ Shipped (Step 9, handover predictor — variable 15-60s cadence):
 - `down_sustain_ms=1000` is a safe upper bound given Starlink handovers max ~300ms. Field data may show distinct bimodal distribution; if so, can be lowered to e.g. 500ms for faster DOWN entry. Tune only with telemetry from the real dish.
 - Starlink LEO satellite handovers happen every **15-60 seconds** (variable per session, not fixed 15s). The FSM is cadence-agnostic; the prediction layer (Step 9) tracks inter-handover intervals over a sliding window and pre-empts only when the coefficient of variation indicates consistent cadence.
 - Compound case (minor obstruction + handover) verified by unit test `test_minor_obstruction_plus_handovers_stays_usable` and by the new `starlink_obstruction_plus_handover.yaml` recipe. FSM correctly stays HEALTHY at 2% baseline (the call-routing decision belongs to QoS layer Step 8, not the classifier).
+
+Shipped (Step 8a, QoS framework — the "Teams survives a WAN drop" moat):
+- `src/qos/ratan-qos-classes.json` — category-pattern → integer mark map.
+  Three classes: realtime (VideoCall/*, VoIP/*, Audio/*, RealTimeChat/*),
+  bulk (Web/*, Streaming/*, DNS, HTTP, TLS, QUIC), background (OS/*,
+  FileTransfer/*, BitTorrent/*, Backup/*).
+- `src/qos/ratan-qos.nft.in` — nftables ruleset matching `ct mark` and
+  setting tc priority (1:10 realtime, 1:20 bulk, 1:30 background, 1:20
+  default for unmarked). Hooked into both `output` and `forward`
+  at priority -150.
+- `src/qos/ratan-qos-apply.sh` — reads `/etc/config/ratan-qos`, builds
+  per-WAN HTB tree (1.5 Mbps realtime floor, configurable; remainder
+  bulk; background capped at 20% of total), loads the nft ruleset.
+  Idempotent.
+- `src/qos/ratan-qos-stop.sh` — reverses apply.
+- `src/qos/README.md` — design notes including the **calibration gap**
+  (real flash needed to verify OMR's nDPI integration actually
+  populates ct->mark; if not, Step 8b adds a marker daemon).
+- `packaging/openwrt/ratan-qos/` — OpenWrt package + procd init
+  (START=92, after network) + UCI defaults. Deps:
+  `+kmod-sched +kmod-sched-core +tc +nftables +kmod-nft-core
+  +kmod-nf-conntrack-netlink`.
+- `ratan-full` metapackage now also depends on `+ratan-qos`.
+
+**Validated in container**: shell scripts pass `sh -n`; nft ruleset
+passes `nft -c -f`; JSON valid; HTB algebra works out at the default
+config (1.5 Mbps floor + 200 Mbps Starlink + 50 Mbps cellular).
+
+**Pending first-flash calibration**:
+- Verify OMR's nDPI-netfilter writes the category id to `ct->mark`
+  (the assumption the framework rests on). One-command check:
+  `conntrack -L | grep mark=` while a known Teams call is active.
+- If the assumption holds → framework just works.
+- If not → Step 8b adds `ratan-qos-marker` (userspace daemon that
+  subscribes to telemetry flow events and writes `ct->mark` itself,
+  using libnetfilter_conntrack or `conntrack -U` shell-out).
+
+**Validation recipe already shipped** — `ratan-test record --recipe qos_isolation`
+asserts MOS stays ≥3.5 throughout an induced WAN drop while bulk
+iperf3 + Teams call are active.
 
 Shipped (Step 11, LuCI dashboard — design integration):
 
