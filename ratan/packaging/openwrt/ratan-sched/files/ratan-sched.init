@@ -1,0 +1,75 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0
+#
+# procd init for ratan-sched: ensures bpffs is mounted, runs ratan_loader
+# (one-shot; pins hold kernel refs), activates the scheduler.
+
+START=70
+STOP=10
+
+USE_PROCD=1
+
+BPF_OBJ="/usr/lib/bpf/ratan_sched.bpf.o"
+LOADER="/usr/sbin/ratan_loader"
+PIN_DIR="/sys/fs/bpf/ratan"
+MPTCP_SCHED_SYSCTL="/proc/sys/net/mptcp/scheduler"
+
+ensure_bpffs() {
+	if ! grep -qs ' /sys/fs/bpf ' /proc/mounts; then
+		mkdir -p /sys/fs/bpf
+		mount -t bpf bpf /sys/fs/bpf || {
+			logger -t ratan-sched "FATAL: failed to mount bpffs"
+			return 1
+		}
+	fi
+}
+
+config_load_safe() {
+	# uci may not be present in failsafe; degrade gracefully.
+	command -v uci >/dev/null 2>&1 && uci -q "$@"
+}
+
+start_service() {
+	local enabled
+	enabled="$(config_load_safe get ratan.sched.enabled 2>/dev/null)"
+	[ "$enabled" = "0" ] && {
+		logger -t ratan-sched "disabled in /etc/config/ratan; not starting"
+		return 0
+	}
+
+	ensure_bpffs || return 1
+
+	if ! "$LOADER" "$BPF_OBJ"; then
+		logger -t ratan-sched "loader failed; see dmesg for verifier output"
+		return 1
+	fi
+
+	local activate
+	activate="$(config_load_safe get ratan.sched.activate_on_boot 2>/dev/null)"
+	if [ "$activate" != "0" ] && [ -w "$MPTCP_SCHED_SYSCTL" ]; then
+		echo ratan > "$MPTCP_SCHED_SYSCTL" 2>/dev/null || \
+			logger -t ratan-sched "WARN: could not set $MPTCP_SCHED_SYSCTL"
+	fi
+
+	logger -t ratan-sched "loaded; weights at ${PIN_DIR}/path_weights"
+}
+
+stop_service() {
+	# Revert to kernel default before unloading so existing sockets don't
+	# end up pointing at a torn-down scheduler.
+	[ -w "$MPTCP_SCHED_SYSCTL" ] && \
+		echo default > "$MPTCP_SCHED_SYSCTL" 2>/dev/null
+
+	"$LOADER" --unload >/dev/null 2>&1
+	logger -t ratan-sched "unloaded"
+}
+
+reload_service() {
+	stop
+	sleep 1
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "ratan"
+}

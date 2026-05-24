@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# uci-defaults: runs once at first boot. Enables the service.
+
+[ -f /etc/config/ratan ] || touch /etc/config/ratan
+
+uci -q batch <<-EOF
+	set ratan.sched=section
+	set ratan.sched.enabled=1
+	set ratan.sched.activate_on_boot=1
+	commit ratan
+EOF
+
+/etc/init.d/ratan-sched enable
+
+exit 0
