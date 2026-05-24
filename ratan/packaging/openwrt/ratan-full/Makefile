@@ -24,9 +24,9 @@ define Package/ratan-full
   URL:=https://github.com/YX12399/openmptcprouter
   DEPENDS:= \
     +openmptcprouter-full \
-    +ratan-sched
+    +ratan-sched \
+    +ratan-prober
   # Future components will be added here as they ship:
-  #   +ratan-prober      (Step 3)
   #   +ratan-telemetry   (Step 4)
   #   +ratan-classifier  (Step 5)
   #   +ratan-predictor   (Step 6)
@@ -42,7 +42,7 @@ define Package/ratan-full/description
   aggregation engine (Starlink-aware MPTCP scheduling, smart prediction,
   sub-200ms failover, QoS, telemetry, LuCI UI).
 
-  Currently includes: ratan-sched.
+  Currently includes: ratan-sched, ratan-prober.
 endef
 
 define Build/Prepare

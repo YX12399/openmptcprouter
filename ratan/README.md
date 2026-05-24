@@ -24,7 +24,7 @@ ratan/
 └── scripts/                        build wrappers                                  [STEP 10]
 ```
 
-## Current state — Steps 1–2 of 17
+## Current state — Steps 1–3 of 17
 
 Shipped (Step 1, scheduler source):
 - `src/sched/ratan_sched.bpf.c` — BPF struct_ops MPTCP scheduler. Default behavior = highest weight in a pinned `ratan_path_weights` map wins; falls back to first-active subflow if weights are all zero.
@@ -39,7 +39,15 @@ Shipped (Step 2, OpenWrt packaging):
 - `packaging/openwrt/ratan-full/Makefile` — metapackage. Selected automatically when `OMR_DIST=ratan OMR_PACKAGES=full`; depends on `openmptcprouter-full + ratan-sched`.
 - `scripts/build-openwrt.sh` — build wrapper. Sets `CUSTOM_FEED` to the in-repo feed subdir (bypassing the URL-clone path in `build.sh`), `OMR_DIST=ratan` (so the feed is `src-link`'d as `ratan`, not colliding with the upstream `openmptcprouter` feed).
 
-Not yet shipped: prober, telemetry, classifier, predictor, QoS, handover learner, CLI, LuCI UI, relay client, debian packaging, VPS bits.
+Shipped (Step 3, fast UDP prober — the sub-200ms KPI workstream):
+- `src/prober/ratan_proto.h` — shared wire format (`struct ratan_probe`, `struct ratan_sample`).
+- `src/prober/ratan_prober.c` — per-WAN UDP probe daemon. One pthread per WAN bound via `SO_BINDTODEVICE`, `timerfd` cadence (CLOCK_MONOTONIC) for low-jitter 50ms sends. Emits samples to `/run/ratan/samples.sock`. **Fast-failover**: on 3 consecutive losses writes `weight=0` directly to the pinned BPF map for that subflow — bypassing the predictor — with an **all-zero guard** that refuses to zero the last live subflow (stranding the user).
+- `src/vps/ratan_probe_responder.c` — stateless echo server for the VPS side. IPv4 + IPv6 (`--ipv6`).
+- `src/prober/Makefile` — standalone dev build.
+- `packaging/openwrt/ratan-prober/` — OpenWrt package + procd init (waits for `ratan-sched`'s BPF map to exist before starting) + UCI config (`/etc/config/ratan-prober`).
+- `ratan-full` metapackage now depends on `+ratan-prober`.
+
+Not yet shipped: telemetry, classifier, predictor, QoS, handover learner, CLI, LuCI UI, relay client, debian packaging, VPS Ansible.
 
 ## Building an actual OMR firmware image (Step 2)
 
@@ -78,6 +86,28 @@ Two important `build.sh` interactions:
 - `OMR_DIST=ratan` makes `build.sh` `src-link` our feed as `ratan` and auto-emit `CONFIG_PACKAGE_ratan-full=y` (which depends on `openmptcprouter-full + ratan-sched`).
 
 First build will take hours (downloads OpenWrt sources, builds toolchain, kernel, all packages). Output lands in `source/bin/targets/<target>/<subtarget>/`.
+
+## Quick prober loopback test (any Linux box, no kernel changes)
+
+```sh
+sudo apt install -y build-essential libbpf-dev
+
+cd ratan/src/prober && make
+cd ../../ && sudo install src/prober/ratan_probe_responder /usr/local/sbin/
+
+# Terminal 1: run the responder
+sudo /usr/local/sbin/ratan_probe_responder --port 5555
+
+# Terminal 2: tail samples (any UDP listener works; here netcat)
+sudo mkdir -p /run/ratan
+nc -uU /run/ratan/samples.sock -l | xxd
+
+# Terminal 3: run the prober against localhost over the loopback iface
+#   (NOTE: real usage uses real WAN ifaces. The BPF map must exist --
+#   on a dev box without ratan-sched loaded, omit --weights-map or expect
+#   bpf_obj_get to fail.)
+sudo ratan_prober --server 127.0.0.1 --wan lo:0 --foreground
+```
 
 ## Quick test on a dev box (Ubuntu 24.04, kernel ≥6.5) — without building a firmware image
 
