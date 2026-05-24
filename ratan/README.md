@@ -24,7 +24,7 @@ ratan/
 └── scripts/                        build wrappers                                  [STEP 10]
 ```
 
-## Current state — Steps 1–4a of 17
+## Current state — Steps 1–4b (harness slice) of 17
 
 Shipped (Step 1, scheduler source):
 - `src/sched/ratan_sched.bpf.c` — BPF struct_ops MPTCP scheduler. Default behavior = highest weight in a pinned `ratan_path_weights` map wins; falls back to first-active subflow if weights are all zero.
@@ -66,7 +66,21 @@ Shipped (Step 4a, telemetry core — the data plane behind every UI/dashboard la
 
 **End-to-end verified locally** (Ubuntu 24.04): the daemon ingests prober-shaped frames, persists them, the session summary is correct, the download endpoint returns the full timeline, and the SSE stream broadcasts events to subscribers within milliseconds.
 
-Not yet shipped (Step 4b): discovery reader (netlink/inotify/UBUS subscribers), per-flow tracker (CTNETLINK + nDPI), MOS computer, `ratan-test` harness with YAML recipes. Then: classifier (Step 5), predictor (Step 6), QoS (Step 8), handover learner (Step 9), CLI (Step 10), LuCI UI (Step 11), relay (Step 12), Vercel dashboard (Step 13).
+Shipped (Step 4b, harness slice — record/list/download tests from the CLI today):
+- `src/prober/ratan_proto.h` — added `struct ratan_inject_event` (108 bytes) so the test harness can write synchronized markers into the telemetry stream.
+- `src/telemetry/ratan_telemetryd.c` — handles `RATAN_EVENT_INJECT`: persists to the `injects` table, broadcasts via SSE so live graphs show vertical lines at every inject. Adds a generic `json_escape()` helper used everywhere user-supplied strings are interpolated into JSON output (caught a real bug during smoke testing — recipe-supplied `detail` containing JSON broke the outer JSON).
+- `src/test/ratan-test` — Python CLI. Subcommands: `record`, `list`, `show ID`, `export ID`, `delete ID`, `list-recipes`, `show-recipe NAME`. Schedules inject actions on thread timers (so the main loop keeps recording), writes markers to the telemetry socket on each fire.
+- `src/test/recipes/` — four shipped recipes:
+  - `kpi_failover.yaml` (60s, blackhole wan0 at T+15s)
+  - `video_call_continuity.yaml` (180s, three handover-shaped blips + a 5s obstruction — the headline JLR demo recipe)
+  - `starlink_baseline.yaml` (600s, passive — for Step 9 handover-cadence learning)
+  - `qos_isolation.yaml` (120s, force a WAN drop while bulk + call are running)
+- `packaging/openwrt/ratan-test/` — OpenWrt package (depends on `+python3-light +python3-urllib +python3-yaml +ratan-telemetry`).
+- `ratan-full` metapackage now also depends on `+ratan-test`.
+
+**Smoke-tested locally end-to-end**: recipe loads → session opens → 3 `mark` injects fire on schedule → each emits a `RATAN_EVENT_INJECT` envelope → daemon persists + broadcasts on SSE within ms → `--output` produces a self-contained, JSON-valid timeline export with all injects (including quote-escaping verified against a `detail` containing `\"` and `\\`).
+
+Not yet shipped: discovery reader (netlink/inotify subscribers), per-flow tracker (CTNETLINK + nDPI), MOS computer. Then: classifier (Step 5), predictor (Step 6), QoS (Step 8), handover learner (Step 9), CLI (Step 10), LuCI UI (Step 11), relay (Step 12), Vercel dashboard (Step 13).
 
 ## Building an actual OMR firmware image (Step 2)
 
@@ -105,6 +119,42 @@ Two important `build.sh` interactions:
 - `OMR_DIST=ratan` makes `build.sh` `src-link` our feed as `ratan` and auto-emit `CONFIG_PACKAGE_ratan-full=y` (which depends on `openmptcprouter-full + ratan-sched`).
 
 First build will take hours (downloads OpenWrt sources, builds toolchain, kernel, all packages). Output lands in `source/bin/targets/<target>/<subtarget>/`.
+
+## Record a test session right now (Ubuntu 24.04, no kernel changes)
+
+The test harness exercises the full Step 4a/4b API even on a dev box.
+
+```sh
+# Once: install deps and build the daemon
+sudo apt install -y build-essential libsqlite3-dev python3-yaml
+cd ratan/src/telemetry && make
+
+# Term 1: run the daemon
+mkdir -p /tmp/ratan
+./ratan_telemetryd \
+    --db /tmp/ratan/t.db --schema ./schema.sql \
+    --sock /tmp/ratan/t.sock --http-host 127.0.0.1 --http-port 9180 \
+    --foreground
+
+# Term 2: list shipped recipes, run a 3-second mark-only test, download the export
+cd ratan/src/test
+./ratan-test --sock /tmp/ratan/t.sock list-recipes
+./ratan-test --sock /tmp/ratan/t.sock record \
+    --name first_run --duration 3 \
+    --inject "at:0.5s mark:hello" \
+    --inject "at:1.5s mark:middle" \
+    --inject "at:2.5s mark:done" \
+    --output /tmp/first_run.json
+
+# inspect what landed
+./ratan-test list
+./ratan-test show 1
+python3 -m json.tool /tmp/first_run.json
+```
+
+The `--inject` form supports `netem_drop:wan0`, `netem_restore:wan0`,
+`netem_blip:wan0/200ms/100`, `netem_delay:wan0/50ms/10ms`, `mark:label`,
+and `shell:<cmd>`. The first three need root (sudo) for `tc`.
 
 ## Quick telemetry daemon test (Ubuntu 24.04, no kernel changes)
 

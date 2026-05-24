@@ -109,6 +109,7 @@ static sqlite3 *g_db;
 static sqlite3_stmt *g_st_ins_sample;
 static sqlite3_stmt *g_st_ins_state;
 static sqlite3_stmt *g_st_ins_weight;
+static sqlite3_stmt *g_st_ins_inject;
 static sqlite3_stmt *g_st_ins_session;
 static sqlite3_stmt *g_st_get_session;
 static sqlite3_stmt *g_st_stop_session;
@@ -166,6 +167,9 @@ static int db_init(const char *path, const char *schema_path)
 		"INSERT INTO weights(ts_ns,wan_id,weight,source,session_id) "
 		"VALUES (?,?,?,?,?)",
 
+		"INSERT INTO injects(ts_ns,session_id,action,target,detail) "
+		"VALUES (?,?,?,?,?)",
+
 		"INSERT INTO sessions(name,started_ns,metadata) VALUES (?,?,?)",
 		"SELECT id,name,started_ns,ended_ns,status,metadata,summary FROM sessions WHERE id=?",
 		"UPDATE sessions SET ended_ns=?, status=?, summary=? WHERE id=?",
@@ -173,6 +177,7 @@ static int db_init(const char *path, const char *schema_path)
 	};
 	sqlite3_stmt **slots[] = {
 		&g_st_ins_sample, &g_st_ins_state, &g_st_ins_weight,
+		&g_st_ins_inject,
 		&g_st_ins_session, &g_st_get_session, &g_st_stop_session,
 		&g_st_active_session,
 	};
@@ -190,6 +195,27 @@ static int db_init(const char *path, const char *schema_path)
 	sqlite3_reset(g_st_active_session);
 
 	return 0;
+}
+
+/* ---------- JSON string escaping ----------
+ * Required everywhere we interpolate user-supplied text (inject detail
+ * comes from YAML recipes via ratan-test and routinely contains quotes;
+ * state.reason / weight.source / etc. are internal but might still grow
+ * special chars in future). Truncates at outsz-1; ensures valid JSON. */
+static size_t json_escape(char *out, size_t outsz, const char *in)
+{
+	size_t o = 0;
+	for (size_t i = 0; in && in[i] && o + 7 < outsz; i++) {
+		unsigned char c = (unsigned char)in[i];
+		if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
+		else if (c == '\n')        { out[o++] = '\\'; out[o++] = 'n'; }
+		else if (c == '\r')        { out[o++] = '\\'; out[o++] = 'r'; }
+		else if (c == '\t')        { out[o++] = '\\'; out[o++] = 't'; }
+		else if (c < 0x20)         { o += snprintf(out + o, outsz - o, "\\u%04x", c); }
+		else                       { out[o++] = (char)c; }
+	}
+	out[o] = '\0';
+	return o;
 }
 
 /* ---------- SSE broadcast ---------- */
@@ -298,12 +324,14 @@ static void on_state(const struct ratan_state_event *e)
 	if (sqlite3_step(g_st_ins_state) != SQLITE_DONE)
 		LOGW("ins_state: %s", sqlite3_errmsg(g_db));
 
-	char j[256];
+	char j[384], fs[32], ts[32], rs[96];
+	json_escape(fs, sizeof(fs), e->from_state);
+	json_escape(ts, sizeof(ts), e->to_state);
+	json_escape(rs, sizeof(rs), e->reason);
 	int n = snprintf(j, sizeof(j),
 		"{\"kind\":\"state\",\"ts_ns\":%llu,\"wan\":%u,"
-		"\"from\":\"%.15s\",\"to\":\"%.15s\",\"reason\":\"%.31s\"}",
-		(unsigned long long)e->ts_ns, e->wan_id,
-		e->from_state, e->to_state, e->reason);
+		"\"from\":\"%s\",\"to\":\"%s\",\"reason\":\"%s\"}",
+		(unsigned long long)e->ts_ns, e->wan_id, fs, ts, rs);
 	if (n > 0) sse_broadcast(j, (size_t)n);
 }
 
@@ -321,11 +349,39 @@ static void on_weight(const struct ratan_weight_event *e)
 	if (sqlite3_step(g_st_ins_weight) != SQLITE_DONE)
 		LOGW("ins_weight: %s", sqlite3_errmsg(g_db));
 
-	char j[160];
+	char j[192], src[24];
+	json_escape(src, sizeof(src), e->source);
 	int n = snprintf(j, sizeof(j),
 		"{\"kind\":\"weight\",\"ts_ns\":%llu,\"wan\":%u,"
-		"\"weight\":%u,\"source\":\"%.7s\"}",
-		(unsigned long long)e->ts_ns, e->wan_id, e->weight, e->source);
+		"\"weight\":%u,\"source\":\"%s\"}",
+		(unsigned long long)e->ts_ns, e->wan_id, e->weight, src);
+	if (n > 0) sse_broadcast(j, (size_t)n);
+}
+
+static void on_inject(const struct ratan_inject_event *e)
+{
+	/* The injects table has session_id NOT NULL with FK CASCADE -- writing
+	 * with session_id <= 0 silently drops. ratan-test always supplies a
+	 * valid id from the session it just created via POST /sessions. */
+	if (e->session_id <= 0) return;
+
+	sqlite3_reset(g_st_ins_inject);
+	sqlite3_bind_int64(g_st_ins_inject, 1, (sqlite3_int64)e->ts_ns);
+	sqlite3_bind_int  (g_st_ins_inject, 2, e->session_id);
+	sqlite3_bind_text (g_st_ins_inject, 3, e->action, -1, SQLITE_TRANSIENT);
+	sqlite3_bind_text (g_st_ins_inject, 4, e->target, -1, SQLITE_TRANSIENT);
+	sqlite3_bind_text (g_st_ins_inject, 5, e->detail, -1, SQLITE_TRANSIENT);
+	if (sqlite3_step(g_st_ins_inject) != SQLITE_DONE)
+		LOGW("ins_inject: %s", sqlite3_errmsg(g_db));
+
+	char j[512], act[32], tgt[32], det[160];
+	json_escape(act, sizeof(act), e->action);
+	json_escape(tgt, sizeof(tgt), e->target);
+	json_escape(det, sizeof(det), e->detail);
+	int n = snprintf(j, sizeof(j),
+		"{\"kind\":\"inject\",\"ts_ns\":%llu,\"session\":%d,"
+		"\"action\":\"%s\",\"target\":\"%s\",\"detail\":\"%s\"}",
+		(unsigned long long)e->ts_ns, e->session_id, act, tgt, det);
 	if (n > 0) sse_broadcast(j, (size_t)n);
 }
 
@@ -354,7 +410,11 @@ static void ingest(const uint8_t *buf, size_t n)
 	case RATAN_EVENT_WEIGHT:
 		if (h->len == sizeof(struct ratan_weight_event)) on_weight(p);
 		break;
-	/* RATAN_EVENT_DISCOVERY/FLOW/MOS/INJECT: Step 4b. Persisted later. */
+	case RATAN_EVENT_INJECT:
+		if (h->len == sizeof(struct ratan_inject_event)) on_inject(p);
+		break;
+	/* RATAN_EVENT_DISCOVERY/FLOW/MOS: arriving in subsequent Step 4b
+	 * commits (netlink+inotify+CTNETLINK subscribers + MOS computer). */
 	default:
 		break;
 	}
@@ -494,12 +554,13 @@ static void route_sessions_list(int fd)
 		sqlite3_int64 ended = sqlite3_column_type(st, 3) == SQLITE_NULL ? 0
 				     : sqlite3_column_int64(st, 3);
 		const unsigned char *status = sqlite3_column_text(st, 4);
+		char esc_name[256], esc_status[32];
+		json_escape(esc_name, sizeof(esc_name), name ? (const char *)name : "");
+		json_escape(esc_status, sizeof(esc_status), status ? (const char *)status : "");
 		len += snprintf(out + len, 65536 - len,
 			"{\"id\":%d,\"name\":\"%s\",\"started_ns\":%lld,"
 			"\"ended_ns\":%lld,\"status\":\"%s\"}",
-			id, name ? (const char *)name : "",
-			(long long)started, (long long)ended,
-			status ? (const char *)status : "");
+			id, esc_name, (long long)started, (long long)ended, esc_status);
 	}
 	len += snprintf(out + len, 65536 - len, "]}");
 	sqlite3_finalize(st);
@@ -667,7 +728,7 @@ static void route_sessions_get(int fd, int id)
 	if (sqlite3_step(g_st_get_session) != SQLITE_ROW) {
 		send_status(fd, 404, "text/plain", "", 0); return;
 	}
-	char resp[16384];
+	char resp[16384], esc_name[256], esc_status[32];
 	const unsigned char *name = sqlite3_column_text(g_st_get_session, 1);
 	sqlite3_int64 started = sqlite3_column_int64(g_st_get_session, 2);
 	sqlite3_int64 ended = sqlite3_column_type(g_st_get_session, 3) == SQLITE_NULL ? 0
@@ -675,13 +736,16 @@ static void route_sessions_get(int fd, int id)
 	const unsigned char *status  = sqlite3_column_text(g_st_get_session, 4);
 	const unsigned char *meta    = sqlite3_column_text(g_st_get_session, 5);
 	const unsigned char *summary = sqlite3_column_text(g_st_get_session, 6);
+	json_escape(esc_name,   sizeof(esc_name),   name   ? (const char *)name   : "");
+	json_escape(esc_status, sizeof(esc_status), status ? (const char *)status : "");
 
+	/* metadata + summary are stored as JSON literals (or empty); pass through
+	 * untouched if non-empty, else null. They originate from us, never the
+	 * wire, so they're safe to inline. */
 	int n = snprintf(resp, sizeof(resp),
 		"{\"id\":%d,\"name\":\"%s\",\"started_ns\":%lld,\"ended_ns\":%lld,"
 		"\"status\":\"%s\",\"metadata\":%s,\"summary\":%s}",
-		id, name ? (const char *)name : "",
-		(long long)started, (long long)ended,
-		status ? (const char *)status : "",
+		id, esc_name, (long long)started, (long long)ended, esc_status,
 		meta && *meta ? (const char *)meta : "null",
 		summary && *summary ? (const char *)summary : "null");
 	send_status(fd, 200, "application/json", resp, (size_t)n);
@@ -709,12 +773,13 @@ static void route_sessions_download(int fd, int id)
 			       : sqlite3_column_int64(g_st_get_session, 3);
 	const unsigned char *status  = sqlite3_column_text(g_st_get_session, 4);
 	const unsigned char *summary = sqlite3_column_text(g_st_get_session, 6);
+	char esc_name[256], esc_status[32];
+	json_escape(esc_name,   sizeof(esc_name),   name   ? (const char *)name   : "");
+	json_escape(esc_status, sizeof(esc_status), status ? (const char *)status : "");
 	len += snprintf(buf + len, cap - len,
 		"{\"session\":{\"id\":%d,\"name\":\"%s\",\"started_ns\":%lld,"
 		"\"ended_ns\":%lld,\"status\":\"%s\",\"summary\":%s},",
-		id, name ? (const char *)name : "",
-		(long long)started, (long long)ended,
-		status ? (const char *)status : "",
+		id, esc_name, (long long)started, (long long)ended, esc_status,
 		summary && *summary ? (const char *)summary : "null");
 
 #define DUMP(tbl, fields, fmt, ...) do { \
@@ -759,6 +824,39 @@ static void route_sessions_download(int fd, int id)
 	     (const char *)sqlite3_column_text(st, 3));
 
 #undef DUMP
+
+	/* Injects need string-escape on each text column (detail may contain
+	 * JSON literals from recipes), so we don't use the simple DUMP macro. */
+	len += snprintf(buf + len, cap - len, "\"injects\":[");
+	{
+		bool first = true;
+		const char *q = "SELECT ts_ns,action,target,detail FROM injects "
+				"WHERE session_id=? ORDER BY ts_ns";
+		if (sqlite3_prepare_v2(g_db, q, -1, &st, NULL) == SQLITE_OK) {
+			sqlite3_bind_int(st, 1, id);
+			while (sqlite3_step(st) == SQLITE_ROW) {
+				if (cap - len < 1024) {
+					len += snprintf(buf + len, cap - len, "/* truncated */");
+					break;
+				}
+				if (!first) len += snprintf(buf + len, cap - len, ",");
+				first = false;
+				char act[64], tgt[64], det[256];
+				json_escape(act, sizeof(act),
+					(const char *)sqlite3_column_text(st, 1));
+				json_escape(tgt, sizeof(tgt),
+					(const char *)sqlite3_column_text(st, 2));
+				json_escape(det, sizeof(det),
+					(const char *)sqlite3_column_text(st, 3));
+				len += snprintf(buf + len, cap - len,
+					"{\"ts\":%lld,\"action\":\"%s\",\"target\":\"%s\",\"detail\":\"%s\"}",
+					(long long)sqlite3_column_int64(st, 0),
+					act, tgt, det);
+			}
+			sqlite3_finalize(st);
+		}
+		len += snprintf(buf + len, cap - len, "],");
+	}
 
 	/* Trim trailing comma if present */
 	if (len > 0 && buf[len - 1] == ',') len--;
@@ -1069,6 +1167,7 @@ int main(int argc, char **argv)
 	sqlite3_finalize(g_st_ins_sample);
 	sqlite3_finalize(g_st_ins_state);
 	sqlite3_finalize(g_st_ins_weight);
+	sqlite3_finalize(g_st_ins_inject);
 	sqlite3_finalize(g_st_ins_session);
 	sqlite3_finalize(g_st_get_session);
 	sqlite3_finalize(g_st_stop_session);

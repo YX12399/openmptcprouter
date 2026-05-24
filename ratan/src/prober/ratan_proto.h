@@ -89,4 +89,16 @@ struct ratan_weight_event {
 	char     source[8];    /* "predict", "prober", "manual" */
 } __attribute__((packed));
 
+/* Inject-marker payload (RATAN_EVENT_INJECT). Test harness writes one of
+ * these every time it triggers / restores a tc netem condition, so the
+ * timeline in any UI graph has synchronized vertical markers. 112 bytes. */
+struct ratan_inject_event {
+	uint64_t ts_ns;
+	int32_t  session_id;   /* must reference an active session */
+	char     action[16];   /* "netem_drop", "netem_restore", "netem_blip",
+	                          "netem_delay", "mark", "shell" */
+	char     target[16];   /* iface name or "" */
+	char     detail[64];   /* free-form (loss%, duration, etc.) */
+} __attribute__((packed));
+
 #endif /* RATAN_PROTO_H */

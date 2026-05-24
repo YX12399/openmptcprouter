@@ -1,0 +1,40 @@
+# QoS isolation test -- the SoW moat.
+#
+# Saturate the bond with bulk traffic (iperf3 from the LAN), then
+# start a video call mid-test. Drop a WAN to force aggregation.
+# Without ratan-qos: the call's bandwidth gets squeezed by iperf3
+# and the call degrades. With ratan-qos: the real-time class
+# floor protects the call; iperf3 absorbs the entire hit.
+#
+# This recipe doesn't START iperf3 or a video call (those are
+# external to the router) -- it just provides the inject schedule
+# and bookends the recording. Start the bulk + call manually then
+# kick this recipe.
+#
+# Pass criterion: per-flow MOS for VideoCall/* stays >= 3.5 even
+# during the iface drop.
+
+name: qos_isolation
+description: "Real-time class survives a WAN drop while bulk absorbs the hit"
+duration: 120s
+
+metadata:
+  test_type: qos_isolation_moat
+  setup:
+    - "Start 'iperf3 -c <vps> -t 120' from a LAN client (bulk)"
+    - "Start a video call from a second LAN client"
+    - "Then kick this recipe"
+  pass_criteria:
+    - "MOS for VideoCall/* >= 3.5 throughout"
+    - "iperf3 bandwidth tracks remaining capacity after drop"
+
+injects:
+  - at: 30s
+    action: mark
+    target: ""
+  - at: 45s
+    action: netem_drop
+    target: wan0
+  - at: 75s
+    action: netem_restore
+    target: wan0

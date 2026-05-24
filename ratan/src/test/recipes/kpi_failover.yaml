@@ -1,0 +1,30 @@
+# Sub-200ms-failover KPI test.
+#
+# Drops wan0 completely at T+15s; restores at T+45s. Expectation:
+# the prober writes weight=0 within ~150ms of the blackhole start
+# (3 missed 50ms probes), the BPF scheduler stops sending packets
+# on that subflow, and any active TCP flow's dip stays well under
+# 200ms.
+#
+# Pass criterion (verified manually from the exported session.json):
+#   - first RATAN_SAMPLE_FAST_FAILOVER on wan0 within 200ms of the
+#     drop_iface inject
+#   - no RST seen on the LAN side (capture out-of-band with tcpdump)
+
+name: kpi_failover
+description: "Measure dip duration when wan0 is blackholed"
+duration: 60s
+
+metadata:
+  test_type: sub_200ms_KPI
+  pass_criteria:
+    - "fast_failover_event within 200ms of drop"
+    - "no app-visible RST"
+
+injects:
+  - at: 15s
+    action: netem_drop
+    target: wan0
+  - at: 45s
+    action: netem_restore
+    target: wan0
