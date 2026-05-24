@@ -110,6 +110,11 @@ Shipped (Step 5, the smart classifier — the **heart of "smart"**):
 
 **Verified end-to-end locally**: telemetry daemon + classifier started; fed 1.25s of baseline OK samples on two WANs (25ms / 60ms), then 5 consecutive losses on WAN 0 (the Starlink-handover signature); classifier transitioned `HEALTHY → TRANSIENT (consec_loss_100ms)` then `TRANSIENT → HEALTHY (blip_ended_200ms)` 350ms later; **weight stayed at 70 the whole time**; transitions correctly persisted in the SQLite `state_transitions` table.
 
+**Step 5 hardware-test notes (carry forward):**
+- `down_sustain_ms=1000` is a safe upper bound given Starlink handovers max ~300ms. Field data may show distinct bimodal distribution; if so, can be lowered to e.g. 500ms for faster DOWN entry. Tune only with telemetry from the real dish.
+- Starlink LEO satellite handovers happen every **15-60 seconds** (variable per session, not fixed 15s). The FSM is cadence-agnostic; the prediction layer (Step 9) tracks inter-handover intervals over a sliding window and pre-empts only when the coefficient of variation indicates consistent cadence.
+- Compound case (minor obstruction + handover) verified by unit test `test_minor_obstruction_plus_handovers_stays_usable` and by the new `starlink_obstruction_plus_handover.yaml` recipe. FSM correctly stays HEALTHY at 2% baseline (the call-routing decision belongs to QoS layer Step 8, not the classifier).
+
 ### Step 5 complete. What we can do today:
 
 ```sh

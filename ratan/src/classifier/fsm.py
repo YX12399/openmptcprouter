@@ -6,18 +6,37 @@ States:
     TRANSIENT  -- expected blip (handover or matched-signature spike);
                   weight unchanged so aggregation continues
     DEGRADING  -- sustained worsening; weight smoothly decayed; MP_PRIO=backup
-    DOWN       -- probe loss >90% for >150ms; weight=0 immediately
+    DOWN       -- >=down_sustain_ms of consecutive loss; weight=0
 
-Transitions and the "Starlink-aware" trick:
-    The two-channel decomposition (rtt_baseline vs rtt_transient) is what
-    stops the 15s-handover thrash. Brief spikes only move the transient
-    channel; only sustained worsening of the BASELINE channel moves us
-    out of HEALTHY into DEGRADING. The TRANSIENT state is a holding pen
-    for blips that match the handover signature -- weight stays at
-    baseline so the user never feels the blip.
+Starlink reality (calibrated against documented behavior; verify on the
+real dish during Manchester field testing):
+    - LEO satellite handovers happen every 15 to 60 SECONDS (not a fixed
+      15s -- the cadence varies per session and within a session).
+    - Each handover produces ~50-300ms of loss + RTT spike.
+    - Minor obstructions (tree branches, structures) add a baseline loss
+      floor (1-5%) that COMPOUNDS with handover blips: the same handover
+      that's invisible on a clean dish becomes a real dropout when the
+      dish was already struggling.
+
+The FSM is intentionally cadence-AGNOSTIC: it reacts to any 100ms+
+consecutive-loss streak as TRANSIENT regardless of phase. Cadence-aware
+PRE-EMPTION (shifting weight ~30ms BEFORE a predicted handover) lives in
+Step 9's handover phase tracker, which plugs in via the optional
+`preempter` callback. For variable 15-60s intervals, that tracker can't
+use simple autocorrelation; it tracks inter-handover intervals over a
+sliding window and predicts the next interval if the recent variance is
+low enough to arm the preempter.
+
+Compound-degradation behavior (obstruction + handover):
+    Baseline loss above healthy_loss_pct (1%) prevents the TRANSIENT
+    recovery streak from completing -- the FSM correctly promotes to
+    DEGRADING in this case, which is the RIGHT outcome: a 2% baseline-
+    loss link with periodic handovers IS degraded, and the smooth
+    weight decay shifts traffic toward cellular without abandoning
+    Starlink entirely. See test_minor_obstruction_plus_handover.
 
 This module is PURE -- takes samples, returns transitions. No I/O. The
-orchestrator (ratan_classifier.py) calls .on_sample() and acts on the
+orchestrator (ratan-classifier) calls .on_sample() and acts on the
 returned transition object.
 """
 
@@ -99,6 +118,12 @@ class FsmConfig:
     # writes weight=0 to the BPF map at 3 consecutive losses (~150ms) for
     # the sub-200ms KPI -- we don't duplicate that here; we just track
     # state so we can manage recovery cleanly.
+    #
+    # TUNING NOTE for real-hardware testing: 1000ms is a safe upper bound
+    # given Starlink handovers max ~300ms. If field data shows distinct
+    # bimodal distribution (handovers cluster < 400ms, real blackholes
+    # > N seconds), this can be lowered to e.g. 500ms for faster DOWN
+    # entry. Test before tuning.
     down_sustain_ms: int = 1000
 
     # DOWN -> HEALTHY (skip DEGRADING when probes resume).

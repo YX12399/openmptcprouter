@@ -219,5 +219,126 @@ class TestNoSpuriousTransitions(unittest.TestCase):
                          "steady state must be silent (no spurious transitions)")
 
 
+class TestCompoundDegradation(unittest.TestCase):
+    """Real-world Starlink scenario: a partially-obstructed dish has a
+    baseline loss rate AND still does its normal 15-60s satellite
+    handovers. The classifier behavior depends on how bad the
+    obstruction is:
+
+      - MINOR obstruction (1-5% baseline loss): link is still usable
+        for most traffic. FSM stays in HEALTHY between handovers,
+        excurses through TRANSIENT during each handover, weight never
+        decays. The decision "route Teams flow via FEC tunnel" belongs
+        to the QoS layer (Step 8), not the classifier.
+
+      - SUSTAINED HIGH obstruction (>= degrading_loss_pct = 10% for >=
+        degrading_sustain_ms = 2s): genuine degradation. FSM goes to
+        DEGRADING with smooth weight decay, traffic shifts toward
+        cellular.
+
+      - BLACKHOLE (>= down_sustain_ms = 1s consecutive loss): FSM goes
+        DOWN. Prober independently writes weight=0 within 150ms via
+        the BPF map for the sub-200ms KPI.
+    """
+
+    def _stream_with_loss_rate(self, fsm, start_t_ms, duration_ms,
+                                loss_rate, handovers_at_ms=()):
+        """Deterministic sample stream with given baseline loss rate.
+        Inject 250ms blips at the given offsets from start."""
+        import random
+        random.seed(42)
+        t = start_t_ms
+        end = start_t_ms + duration_ms
+        states_seen = []
+        while t < end:
+            is_handover_blip = any(
+                h_start <= (t - start_t_ms) < h_start + 250
+                for h_start in handovers_at_ms)
+            loss = True if is_handover_blip else (random.random() < loss_rate)
+            fsm.on_sample(mk_sample(t, loss=loss))
+            states_seen.append(fsm.state)
+            t += 50
+        return t, states_seen
+
+    def test_minor_obstruction_plus_handovers_stays_usable(self):
+        """2% baseline + handovers every 4s: should stay HEALTHY between,
+        TRANSIENT during, never DEGRADING/DOWN, weight always at baseline."""
+        cfg = FsmConfig()
+        fsm = WanFsm(wan_id=0, capacity_mbps=200, cfg=cfg, baseline_weight=70)
+        t = seed_healthy_baseline(fsm)
+        self.assertEqual(fsm.state, State.HEALTHY)
+
+        weights = [fsm.weight]
+        t, states = self._stream_with_loss_rate(
+            fsm, t, 12000, loss_rate=0.02,
+            handovers_at_ms=(4000, 8000))
+        weights.append(fsm.weight)
+
+        # Did we excurse through TRANSIENT at least once? (proves the
+        # handovers WERE seen as blips)
+        self.assertIn(State.TRANSIENT, states,
+            "must have visited TRANSIENT during handover")
+        # End state: back to HEALTHY (recovered)
+        self.assertEqual(fsm.state, State.HEALTHY,
+            "after recovery from handovers, must return to HEALTHY")
+        # Weight never decayed (TRANSIENT preserves weight; never reached DEGRADING)
+        self.assertEqual(min(weights), 70,
+            "minor obstruction + handovers must NOT decay weight")
+        # Never went DEGRADING or DOWN
+        self.assertNotIn(State.DEGRADING, states,
+            "2% baseline + handovers must not trigger DEGRADING")
+        self.assertNotIn(State.DOWN, states,
+            "2% baseline + handovers must not trigger DOWN")
+
+    def test_high_obstruction_does_enter_degrading(self):
+        """12% baseline loss for several seconds: FSM should DEGRADE."""
+        cfg = FsmConfig()
+        fsm = WanFsm(wan_id=0, capacity_mbps=200, cfg=cfg, baseline_weight=70)
+        t = seed_healthy_baseline(fsm)
+
+        t, _ = self._stream_with_loss_rate(
+            fsm, t, 5000, loss_rate=0.12, handovers_at_ms=())
+
+        self.assertEqual(fsm.state, State.DEGRADING,
+            "sustained 12% loss must trigger DEGRADING")
+        self.assertLess(fsm.weight, 70, "weight must have decayed")
+        self.assertGreaterEqual(fsm.weight, cfg.degrading_weight_floor,
+            "weight must never fully fall to 0 in DEGRADING -- floor preserves recovery")
+
+
+class TestVariableCadenceHandovers(unittest.TestCase):
+    """Starlink handovers happen at 15-60s intervals (variable). The FSM
+    must NOT depend on a fixed cadence; each blip is treated as TRANSIENT
+    independently."""
+
+    def test_handovers_at_15s_30s_45s_60s_intervals(self):
+        """4 handovers at irregular spacing: 15s, then 30s later, then
+        45s later, then 60s later (total ~150s). All should be TRANSIENT
+        with no weight decay."""
+        cfg = FsmConfig()
+        fsm = WanFsm(wan_id=0, capacity_mbps=200, cfg=cfg, baseline_weight=70)
+        t = seed_healthy_baseline(fsm)
+
+        intervals_ms = [15000, 30000, 45000, 60000]
+        min_weight = 70
+        for interval in intervals_ms:
+            # quiet for interval
+            quiet_samples = interval // 50
+            for _ in range(quiet_samples):
+                fsm.on_sample(mk_sample(t)); t += 50
+                min_weight = min(min_weight, fsm.weight)
+            # 5-sample handover blip
+            for _ in range(5):
+                fsm.on_sample(mk_sample(t, loss=True)); t += 50
+                min_weight = min(min_weight, fsm.weight)
+            # short recovery
+            for _ in range(20):
+                fsm.on_sample(mk_sample(t)); t += 50
+                min_weight = min(min_weight, fsm.weight)
+
+        self.assertEqual(min_weight, 70,
+            "variable-cadence handovers (15-60s spacing) must not decay weight")
+
+
 if __name__ == "__main__":
     unittest.main()

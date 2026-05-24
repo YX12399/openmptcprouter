@@ -1,0 +1,72 @@
+# Compound degradation: minor obstruction + Starlink handover.
+#
+# Real-world scenario flagged during Step 5 review: a partially-
+# obstructed Starlink dish has 1-5% baseline loss AND still does
+# its 15-60s LEO satellite handovers. The combination produces
+# noticeable dropouts during the handover that wouldn't have been
+# visible on a clean dish.
+#
+# What this recipe does: simulates the combined effect on wan0
+# using tc netem -- 2% sustained loss with three 250ms full-loss
+# blips at irregular intervals (mimicking the 15-60s variable
+# handover cadence).
+#
+# Pass criterion (verify from the session export):
+#   - FSM stays in HEALTHY between handovers (2% baseline alone
+#     is not enough to trigger DEGRADING)
+#   - FSM excurses through TRANSIENT during each handover
+#   - Weight stays at baseline throughout (no decay)
+#   - For Teams call running concurrently: MOS stays >= 3.5
+#     during quiet periods; brief dip during handover acceptable
+#     as long as it recovers within 1s
+#
+# Pair with the classifier's unit test
+# test_minor_obstruction_plus_handovers_stays_usable for the
+# isolated synthetic version.
+
+name: starlink_obstruction_plus_handover
+description: "Compound: 2% baseline loss + 3 variable-cadence handover blips"
+duration: 120s
+
+metadata:
+  test_type: compound_degradation
+  scenario: "partial obstruction + LEO handover cadence (15-60s variable)"
+  pass_criteria:
+    - "FSM does not enter DEGRADING from baseline alone"
+    - "FSM visits TRANSIENT during each handover"
+    - "Weight stays at baseline"
+    - "MOS >= 3.5 for VideoCall/* in steady state"
+
+injects:
+  # Establish the 2% baseline obstruction
+  - at: 5s
+    action: netem_delay
+    target: wan0
+    delay_ms: 35
+    jitter_ms: 5
+
+  # First handover at +15s (lower end of cadence range)
+  - at: 15s
+    action: netem_blip
+    target: wan0
+    duration: 250ms
+    loss: 100
+
+  # Second at +33s (typical mid-range cadence)
+  - at: 33s
+    action: netem_blip
+    target: wan0
+    duration: 200ms
+    loss: 100
+
+  # Third at +60s (upper end of cadence range)
+  - at: 60s
+    action: netem_blip
+    target: wan0
+    duration: 300ms
+    loss: 100
+
+  # Clean up the baseline delay
+  - at: 115s
+    action: netem_restore
+    target: wan0
