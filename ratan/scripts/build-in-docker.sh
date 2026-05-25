@@ -5,28 +5,49 @@
 # OpenWrt build. Runs the build inside a Debian container so you don't
 # have to set up the Linux build host yourself.
 #
-# Usage (from anywhere):
-#   ratan/scripts/build-in-docker.sh                 # default: rpi4
+# Usage:
+#   ratan/scripts/build-in-docker.sh [target]
 #   ratan/scripts/build-in-docker.sh rpi4
-#   ratan/scripts/build-in-docker.sh x86_64
+#   ratan/scripts/build-in-docker.sh --named-volume rpi4
 #
-# What this does:
-#   1. Builds (and caches) the Debian build-environment image.
-#   2. Runs the OMR build inside a container.
-#   3. Output lands in <repo>/source/bin/targets/... on the host.
+# Modes:
+#   default (bind-mount): the repo is mounted from the host; outputs
+#     land in <repo>/source/bin/targets/... on the host. REQUIRES a
+#     case-sensitive host filesystem (OpenWrt refuses otherwise).
+#     On macOS that means an APFS (Case-sensitive) volume.
+#   --named-volume:       repo is cloned INSIDE a Docker-managed Linux
+#     volume (always case-sensitive). Use this on macOS when you don't
+#     want to create a separate APFS volume. Pull the final image out
+#     with: docker run --rm -v ratan-build-vol:/build -v "$PWD":/out \
+#                  alpine cp /build/openmptcprouter/source/bin/...img.gz /out/
 #
 # Resource requirements (Docker Desktop -> Settings -> Resources):
-#   - RAM:  >= 6 GB (default 4 GB usually OK; bump if OOM)
+#   - RAM:  >= 8 GB recommended (6 GB minimum)
 #   - Disk: >= 40 GB for the container's working set
-#   - CPUs: more = faster build; default 4 is fine
+#   - CPUs: more = faster build
 # First build: 2-4 hours. Subsequent: minutes (incremental).
 
 set -euo pipefail
 
-TARGET="${1:-rpi4}"
+MODE="bindmount"
+TARGET="rpi4"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --named-volume) MODE="namedvol"; shift ;;
+        --bindmount)    MODE="bindmount"; shift ;;
+        -h|--help)
+            sed -n '2,30p' "$0"
+            exit 0 ;;
+        *) TARGET="$1"; shift ;;
+    esac
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 IMG_TAG="ratan-build:latest"
+VOL_NAME="ratan-build-vol"
+REPO_URL="${RATAN_REPO_URL:-https://github.com/YX12399/openmptcprouter.git}"
+REPO_BRANCH="${RATAN_REPO_BRANCH:-claude/explore-openmptcprouter-z8iF1}"
 
 # Sanity: docker present?
 if ! command -v docker >/dev/null 2>&1; then
@@ -47,14 +68,53 @@ EOF
     exit 1
 fi
 
+# --- bindmount preflight: detect case-insensitive FS and fail fast -----------
+if [ "$MODE" = "bindmount" ]; then
+    probe="$REPO_DIR/.ratan-case-probe"
+    mkdir -p "$probe"
+    : > "$probe/CaseSensitive"
+    if [ -e "$probe/casesensitive" ]; then
+        rm -rf "$probe"
+        cat >&2 <<EOF
+ERROR: $REPO_DIR is on a case-INSENSITIVE filesystem.
+
+OpenWrt's prereq check will refuse to build here. macOS APFS is
+case-insensitive by default. Two ways forward:
+
+  1) Easiest: create a case-sensitive APFS volume in Disk Utility
+     (File -> Add APFS Volume, Format: APFS (Case-sensitive)),
+     clone the repo into /Volumes/<name>/ and re-run this script
+     from there.
+
+  2) Alternative: use a Docker-managed Linux volume (always
+     case-sensitive). Re-run this script with --named-volume:
+
+         $0 --named-volume $TARGET
+
+     The repo will be cloned inside the volume; pull the image out
+     at the end with the docker cp command this script prints.
+EOF
+        exit 1
+    fi
+    rm -rf "$probe"
+fi
+
 cat <<EOF
 
 =================================================================
 RATAN OpenMPTCProuter build (inside Docker)
 
+  Mode:     $MODE
   Target:   $TARGET
-  Repo:     $REPO_DIR
   Image:    $IMG_TAG
+EOF
+if [ "$MODE" = "bindmount" ]; then
+    echo "  Repo:     $REPO_DIR  (host bind-mount)"
+else
+    echo "  Volume:   $VOL_NAME  (Docker-managed; case-sensitive)"
+    echo "  Source:   $REPO_URL @ $REPO_BRANCH"
+fi
+cat <<EOF
 
   This will take a few hours on first run. The container builds
   the entire OpenWrt + OMR + ratan stack. You can leave it running
@@ -70,24 +130,61 @@ docker build -t "$IMG_TAG" -f "$SCRIPT_DIR/Dockerfile" "$SCRIPT_DIR/"
 echo ""
 echo "==> [2/2] Running OMR build for target=$TARGET..."
 echo ""
-docker run --rm -it \
-    -v "$REPO_DIR":/build \
-    -w /build \
-    "$IMG_TAG" \
-    bash -c "git config --global --add safe.directory /build && \
-             ratan/scripts/build-openwrt.sh '$TARGET'"
 
-echo ""
-echo "==> Build finished. Looking for images..."
-IMAGES=$(find "$REPO_DIR/source/bin/targets/" -name '*.img.gz' 2>/dev/null | head)
+if [ "$MODE" = "bindmount" ]; then
+    docker run --rm -it \
+        -v "$REPO_DIR":/build \
+        -w /build \
+        "$IMG_TAG" \
+        bash -c "git config --global --add safe.directory /build && \
+                 ratan/scripts/build-openwrt.sh '$TARGET'"
+
+    echo ""
+    echo "==> Build finished. Looking for images..."
+    IMAGES=$(find "$REPO_DIR/source/bin/targets/" -name '*.img.gz' 2>/dev/null | head)
+else
+    # Create the volume if missing, clone the repo on first use, then build.
+    docker volume inspect "$VOL_NAME" >/dev/null 2>&1 || docker volume create "$VOL_NAME"
+    docker run --rm -it \
+        -v "$VOL_NAME":/build \
+        -w /build \
+        "$IMG_TAG" \
+        bash -c "
+            set -e
+            if [ ! -d openmptcprouter/.git ]; then
+                echo '==> Cloning repo into the Docker volume (first run only)...'
+                git clone --branch '$REPO_BRANCH' '$REPO_URL' openmptcprouter
+            else
+                echo '==> Updating repo in the Docker volume...'
+                cd openmptcprouter && git fetch origin '$REPO_BRANCH' && git checkout '$REPO_BRANCH' && git pull --ff-only && cd ..
+            fi
+            cd openmptcprouter
+            ratan/scripts/build-openwrt.sh '$TARGET'
+        "
+
+    echo ""
+    echo "==> Build finished. Looking for images inside the volume..."
+    IMAGES=$(docker run --rm -v "$VOL_NAME":/build "$IMG_TAG" \
+        bash -c "find /build/openmptcprouter/source/bin/targets/ -name '*.img.gz' 2>/dev/null | head" || true)
+fi
+
 if [ -z "$IMAGES" ]; then
     echo "    (no .img.gz files found yet; check the build log above for errors)"
 else
     echo "Images produced:"
-    echo "$IMAGES" | while read -r f; do
-        sz=$(du -h "$f" | cut -f1)
-        echo "  $sz  $f"
-    done
+    if [ "$MODE" = "bindmount" ]; then
+        echo "$IMAGES" | while read -r f; do
+            sz=$(du -h "$f" | cut -f1)
+            echo "  $sz  $f"
+        done
+    else
+        echo "$IMAGES"
+        echo ""
+        echo "To extract the image to your Mac:"
+        first=$(echo "$IMAGES" | head -1)
+        echo "  docker run --rm -v $VOL_NAME:/build -v \"\$PWD\":/out \\"
+        echo "      $IMG_TAG cp '$first' /out/"
+    fi
 fi
 
 cat <<EOF
