@@ -17,13 +17,17 @@ FROM debian:bookworm
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 
-# All build deps OpenWrt + OMR + ratan need. The list is OpenWrt's
-# official "host build requirements" + a few extras we use (xxd for
-# the BPF toolchain, perl for the OpenWrt Makefiles).
+# All build deps OpenWrt + OMR + ratan need. Filtered for cross-arch
+# compatibility -- OpenWrt's stock dep list includes gcc-multilib
+# (32-bit x86 support) which doesn't exist on arm64 Debian. For an
+# arm64 host (Apple Silicon Mac, Hetzner Ampere) building an arm64
+# target (RPi4 / BCM2711) we don't need multilib -- host tools build
+# with the native arm64 gcc, target tools build with OpenWrt's own
+# cross toolchain.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential clang flex bison g++ gawk \
-        gcc-multilib gettext git libncurses-dev libssl-dev \
+        gettext git libncurses-dev libssl-dev \
         python3 python3-setuptools python3-distutils python3-yaml \
         rsync swig unzip zlib1g-dev file wget curl perl \
         ca-certificates xxd cpio gzip bzip2 xz-utils sudo \
