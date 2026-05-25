@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
+"""
+ratan-test -- session recorder for the RATAN telemetry pipeline.
+
+Records a test session by:
+  1. POST /sessions  on the local telemetry daemon (Step 4a).
+  2. Scheduling inject actions (tc netem, marks, shell commands) via timers.
+  3. Writing RATAN_EVENT_INJECT envelopes to /run/ratan/telemetry.sock so
+     every inject appears as a synchronized vertical marker on any UI graph.
+  4. Waiting out the duration (Ctrl-C stops early).
+  5. POST /sessions/<id>/stop  -> daemon computes summary.
+  6. Optionally GET  /sessions/<id>/download -> single-file JSON export.
+
+Subcommands:
+  record [--name | --recipe] [--duration] [--inject SPEC]... [--output PATH]
+  list
+  show ID
+  export ID [--output PATH]
+  delete ID
+  list-recipes
+  show-recipe NAME
+
+Recipe lookup path: /usr/share/ratan/recipes/ (installed) and ./recipes
+(when running from the source tree).
+"""
+
+import argparse
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    yaml = None  # only blocks --recipe usage
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 9180
+DEFAULT_SOCK = "/run/ratan/telemetry.sock"
+RECIPE_DIRS = ["/usr/share/ratan/recipes", "./recipes",
+               os.path.join(os.path.dirname(__file__), "recipes")]
+
+# Must match ratan_proto.h
+RATAN_PROTO_VERSION = 1
+RATAN_EVENT_INJECT = 7
+INJECT_FMT = "<Qi16s16s64s"   # ts_ns, session_id, action[16], target[16], detail[64]
+INJECT_SIZE = struct.calcsize(INJECT_FMT)   # 108
+HDR_FMT = "<BBH"
+HDR_SIZE = struct.calcsize(HDR_FMT)
+
+
+# ---------------- HTTP wrapper ----------------
+
+class TelemAPI:
+    def __init__(self, host, port):
+        self.base = f"http://{host}:{port}"
+
+    def _open(self, req, timeout=10):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            raise SystemExit(f"error: HTTP {e.code} from {req.full_url}: {body}")
+
+    def post_json(self, path, data):
+        body = json.dumps(data).encode()
+        req = urllib.request.Request(
+            f"{self.base}{path}", data=body, method="POST",
+            headers={"Content-Type": "application/json"})
+        return json.loads(self._open(req).read())
+
+    def get_json(self, path):
+        return json.loads(self._open(urllib.request.Request(f"{self.base}{path}")).read())
+
+    def get_raw(self, path):
+        return self._open(urllib.request.Request(f"{self.base}{path}"), timeout=60).read()
+
+    def delete(self, path):
+        req = urllib.request.Request(f"{self.base}{path}", method="DELETE")
+        self._open(req).read()
+
+    def start_session(self, name, metadata=None):
+        return self.post_json("/sessions", {"name": name, "metadata": metadata or {}})
+
+    def stop_session(self, sid):
+        return self.post_json(f"/sessions/{sid}/stop", {})
+
+    def list_sessions(self):
+        return self.get_json("/sessions")
+
+    def get_session(self, sid):
+        return self.get_json(f"/sessions/{sid}")
+
+    def download_session(self, sid):
+        return self.get_raw(f"/sessions/{sid}/download")
+
+    def delete_session(self, sid):
+        self.delete(f"/sessions/{sid}")
+
+
+# ---------------- inject envelope writer ----------------
+
+def emit_inject(sock_path, session_id, action, target="", detail=""):
+    """Write a RATAN_EVENT_INJECT envelope to /run/ratan/telemetry.sock.
+    Falls through silently if the daemon isn't reachable -- the inject
+    still ran, we just lost the marker. Returns True if sent."""
+    ts_ns = time.monotonic_ns()
+    # Python on Linux uses CLOCK_MONOTONIC for time.monotonic_ns(), which is
+    # coherent with the daemon's clock_gettime(CLOCK_MONOTONIC).
+    payload = struct.pack(
+        INJECT_FMT,
+        ts_ns, int(session_id),
+        action.encode()[:15],
+        target.encode()[:15],
+        detail.encode()[:63],
+    )
+    hdr = struct.pack(HDR_FMT, RATAN_EVENT_INJECT, RATAN_PROTO_VERSION, INJECT_SIZE)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        s.sendto(hdr + payload, sock_path)
+        return True
+    except OSError as e:
+        print(f"warn: telemetry sock {sock_path}: {e}", file=sys.stderr)
+        return False
+    finally:
+        s.close()
+
+
+# ---------------- inject actions ----------------
+
+def _tc(*args, check=True):
+    """Run tc with sudo if not root; let stderr through for diagnostics."""
+    if os.geteuid() != 0:
+        return subprocess.run(["sudo", "tc", *args], check=check)
+    return subprocess.run(["tc", *args], check=check)
+
+
+def action_netem_drop(target):
+    _tc("qdisc", "add", "dev", target, "root", "netem", "loss", "100%")
+
+
+def action_netem_restore(target):
+    # 'del' fails if no qdisc exists; that's fine -- restore is idempotent.
+    _tc("qdisc", "del", "dev", target, "root", check=False)
+
+
+def action_netem_delay(target, delay_ms, jitter_ms=0):
+    args = ["qdisc", "add", "dev", target, "root", "netem", "delay", f"{delay_ms}ms"]
+    if jitter_ms:
+        args.append(f"{jitter_ms}ms")
+    _tc(*args)
+
+
+def action_netem_blip(target, duration_s, loss_pct=100):
+    """Drop for duration_s, then restore. Runs on the timer thread so the
+    main loop continues recording."""
+    _tc("qdisc", "add", "dev", target, "root", "netem", "loss", f"{loss_pct}%")
+    time.sleep(duration_s)
+    _tc("qdisc", "del", "dev", target, "root", check=False)
+
+
+def action_shell(cmd):
+    subprocess.run(cmd, shell=True, check=False)
+
+
+def parse_duration(s):
+    """'200ms' -> 0.2, '5s' -> 5.0, '1m' -> 60.0, '90' -> 90.0"""
+    s = str(s).strip()
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(ms|s|m)?", s)
+    if not m:
+        raise ValueError(f"bad duration: {s}")
+    v = float(m.group(1))
+    u = m.group(2) or "s"
+    return v / 1000.0 if u == "ms" else (v * 60.0 if u == "m" else v)
+
+
+def execute_action(action, target, detail):
+    """Run an inject's network change. Returns True on success."""
+    try:
+        if action == "netem_drop":
+            action_netem_drop(target)
+        elif action == "netem_restore":
+            action_netem_restore(target)
+        elif action == "netem_delay":
+            d = json.loads(detail) if detail else {}
+            action_netem_delay(target,
+                               int(d.get("delay_ms", 100)),
+                               int(d.get("jitter_ms", 0)))
+        elif action == "netem_blip":
+            d = json.loads(detail) if detail else {}
+            action_netem_blip(target,
+                              parse_duration(d.get("duration", "200ms")),
+                              int(d.get("loss", 100)))
+        elif action == "mark":
+            pass  # marker only; no network change
+        elif action == "shell":
+            action_shell(detail or target)
+        else:
+            print(f"warn: unknown action: {action}", file=sys.stderr)
+            return False
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"warn: action {action} failed: {e}", file=sys.stderr)
+        return False
+
+
+def parse_inject_cli(spec):
+    """Parse '--inject' CLI spec into a dict.
+
+    Forms:
+      at:10s netem_drop:wan0
+      at:15s netem_restore:wan0
+      at:20s netem_blip:wan0/200ms/100
+      at:25s netem_delay:wan0/50ms/10ms
+      at:30s mark:label
+      at:40s shell:echo hi
+    """
+    parts = spec.split(maxsplit=1)
+    if len(parts) < 2 or not parts[0].startswith("at:"):
+        raise ValueError(f"bad inject (missing 'at:'): {spec}")
+    at_s = parse_duration(parts[0][3:])
+
+    rest = parts[1]
+    if ":" not in rest:
+        raise ValueError(f"bad inject (missing action target): {spec}")
+    action, body = rest.split(":", 1)
+    seg = body.split("/")
+    target = seg[0]
+    detail = {}
+    if action == "netem_blip" and len(seg) >= 2:
+        detail["duration"] = seg[1]
+        if len(seg) >= 3:
+            detail["loss"] = seg[2].rstrip("%")
+    elif action == "netem_delay" and len(seg) >= 2:
+        detail["delay_ms"] = int(parse_duration(seg[1]) * 1000)
+        if len(seg) >= 3:
+            detail["jitter_ms"] = int(parse_duration(seg[2]) * 1000)
+    elif action == "mark":
+        target = ""
+        detail = {"label": body}
+    elif action == "shell":
+        target = ""
+        detail = {"cmd": body}
+
+    return {"at": at_s, "action": action, "target": target,
+            "detail": json.dumps(detail) if detail else ""}
+
+
+# ---------------- recipe loader ----------------
+
+def load_recipe(name):
+    if not yaml:
+        sys.exit("error: pyyaml not installed (apt install python3-yaml)")
+    if os.path.isabs(name) or name.startswith("./") or name.startswith("../"):
+        candidates = [name]
+    else:
+        candidates = []
+        for d in RECIPE_DIRS:
+            for ext in ("", ".yaml", ".yml"):
+                candidates.append(os.path.join(d, name + ext))
+    for p in candidates:
+        if os.path.exists(p):
+            with open(p) as f:
+                return yaml.safe_load(f)
+    sys.exit(f"error: recipe {name!r} not found (searched: {RECIPE_DIRS})")
+
+
+def recipe_to_injects(recipe):
+    out = []
+    for inj in recipe.get("injects", []):
+        action = inj["action"]
+        target = inj.get("target", "")
+        detail_keys = {k: v for k, v in inj.items() if k not in ("at", "action", "target")}
+        out.append({
+            "at": parse_duration(str(inj["at"])),
+            "action": action,
+            "target": target,
+            "detail": json.dumps(detail_keys) if detail_keys else "",
+        })
+    return out
+
+
+# ---------------- subcommands ----------------
+
+def cmd_record(args, api):
+    name = args.name
+    duration = args.duration
+    metadata = {"started_wall": time.time()}
+    injects = []
+
+    if args.recipe:
+        recipe = load_recipe(args.recipe)
+        name = name or recipe.get("name", args.recipe)
+        if duration is None:
+            duration = float(parse_duration(recipe.get("duration", 60)))
+        metadata.update({
+            "recipe": args.recipe,
+            "description": recipe.get("description", ""),
+            "expected": recipe.get("metadata", {}),
+        })
+        injects.extend(recipe_to_injects(recipe))
+
+    for spec in (args.inject or []):
+        injects.append(parse_inject_cli(spec))
+
+    if not name:
+        sys.exit("error: --name or --recipe required")
+    if duration is None:
+        duration = 60.0
+
+    # 1. open session
+    sess = api.start_session(name, metadata)
+    sid = sess["id"]
+    print(f"[+] session {sid} started: {name!r}  duration={duration}s  injects={len(injects)}")
+
+    # 2. schedule injects (off the main thread so we keep the clock)
+    timers = []
+    for inj in injects:
+        t = threading.Timer(inj["at"], _run_inject, args=(args.sock, sid, inj))
+        t.daemon = True
+        timers.append(t)
+        t.start()
+
+    # 3. record for the duration (or until Ctrl-C)
+    start = time.monotonic()
+    try:
+        deadline = start + duration
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            print(f"\r[recording] {int(deadline - time.monotonic())}s remaining... ",
+                  end="", file=sys.stderr, flush=True)
+            time.sleep(min(1.0, remaining))
+        print("", file=sys.stderr)
+    except KeyboardInterrupt:
+        print("\n[!] interrupted; stopping session early", file=sys.stderr)
+
+    # cancel any not-yet-fired injects
+    for t in timers:
+        t.cancel()
+
+    # 4. stop session, print summary
+    print(f"[+] stopping session {sid}")
+    result = api.stop_session(sid)
+    print_summary(result.get("summary", {}))
+
+    # 5. optionally save the full export
+    if args.output:
+        data = api.download_session(sid)
+        Path(args.output).write_bytes(data)
+        print(f"[+] full export saved to {args.output} ({len(data)} bytes)")
+
+    return 0
+
+
+def _run_inject(sock_path, session_id, inj):
+    label = f"{inj['action']}/{inj['target']}" if inj['target'] else inj['action']
+    print(f"\n  [inject @ t+{inj['at']:.2f}s] {label}", file=sys.stderr)
+    ok = execute_action(inj["action"], inj["target"], inj["detail"])
+    emit_inject(sock_path, session_id, inj["action"], inj["target"],
+                inj["detail"] if ok else f"FAILED:{inj['detail']}")
+
+
+def print_summary(summary):
+    if not summary:
+        print("(no summary)")
+        return
+    print("[summary]")
+    for w in summary.get("per_wan", []):
+        print(f"  WAN {w['wan']:>2}: samples={w['samples']:>5}  loss={w['loss']:>4}  "
+              f"failover={w['failover']:>3}  rtt_us avg={w['rtt_us_avg']:.0f} "
+              f"max={w['rtt_us_max']}")
+    print(f"  state transitions: {summary.get('state_transitions', 0)}")
+    print(f"  weight changes:    {summary.get('weight_changes', 0)}")
+
+
+def cmd_list(args, api):
+    sessions = api.list_sessions().get("sessions", [])
+    if not sessions:
+        print("(no sessions yet)")
+        return 0
+    print(f"{'ID':>4}  {'STATUS':<10}  {'NAME':<40}  STARTED_NS")
+    for s in sessions:
+        print(f"{s['id']:>4}  {s['status']:<10}  {s['name']:<40.40}  {s['started_ns']}")
+    return 0
+
+
+def cmd_show(args, api):
+    print(json.dumps(api.get_session(args.id), indent=2))
+    return 0
+
+
+def cmd_export(args, api):
+    data = api.download_session(args.id)
+    out = args.output or f"ratan-session-{args.id}.json"
+    Path(out).write_bytes(data)
+    print(f"[+] exported session {args.id} -> {out} ({len(data)} bytes)")
+    return 0
+
+
+def cmd_delete(args, api):
+    api.delete_session(args.id)
+    print(f"[+] deleted session {args.id}")
+    return 0
+
+
+def cmd_list_recipes(args, api):
+    if not yaml:
+        sys.exit("error: pyyaml not installed (apt install python3-yaml)")
+    seen = set()
+    for d in RECIPE_DIRS:
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            if not f.endswith((".yaml", ".yml")):
+                continue
+            name = f.rsplit(".", 1)[0]
+            if name in seen:
+                continue
+            seen.add(name)
+            try:
+                r = yaml.safe_load(open(os.path.join(d, f)))
+                desc = r.get("description", "")
+                dur = r.get("duration", "?")
+                ninj = len(r.get("injects", []))
+                print(f"  {name:<28}  dur={dur} injects={ninj}  {desc}")
+            except Exception as e:
+                print(f"  {name:<28}  (parse error: {e})")
+    if not seen:
+        print(f"(no recipes found in {RECIPE_DIRS})")
+    return 0
+
+
+def cmd_show_recipe(args, api):
+    print(yaml.safe_dump(load_recipe(args.recipe), sort_keys=False))
+    return 0
+
+
+# ---------------- argparse ----------------
+
+def main():
+    p = argparse.ArgumentParser(prog="ratan-test", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--host", default=DEFAULT_HOST)
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--sock", default=DEFAULT_SOCK)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pr = sub.add_parser("record", help="record a test session")
+    pr.add_argument("--name")
+    pr.add_argument("--duration", type=float, help="seconds (default: 60 or recipe value)")
+    pr.add_argument("--recipe", help="recipe name (see list-recipes)")
+    pr.add_argument("--inject", action="append",
+                    help="repeatable; e.g. 'at:10s netem_drop:wan0'")
+    pr.add_argument("--output", help="save full JSON export to this path")
+    pr.set_defaults(fn=cmd_record)
+
+    sub.add_parser("list", help="list past sessions").set_defaults(fn=cmd_list)
+
+    ps = sub.add_parser("show", help="show session details + summary")
+    ps.add_argument("id", type=int); ps.set_defaults(fn=cmd_show)
+
+    pe = sub.add_parser("export", help="download full session as JSON")
+    pe.add_argument("id", type=int)
+    pe.add_argument("--output")
+    pe.set_defaults(fn=cmd_export)
+
+    pd = sub.add_parser("delete", help="delete a session + linked rows")
+    pd.add_argument("id", type=int); pd.set_defaults(fn=cmd_delete)
+
+    sub.add_parser("list-recipes",
+                   help="list available recipes").set_defaults(fn=cmd_list_recipes)
+
+    psr = sub.add_parser("show-recipe", help="print a recipe's YAML")
+    psr.add_argument("recipe"); psr.set_defaults(fn=cmd_show_recipe)
+
+    args = p.parse_args()
+    api = TelemAPI(args.host, args.port)
+    try:
+        return args.fn(args, api)
+    except urllib.error.URLError as e:
+        sys.exit(f"error: cannot reach telemetry HTTP at {args.host}:{args.port}: {e}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

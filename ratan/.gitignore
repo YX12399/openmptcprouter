@@ -1,0 +1,43 @@
+# build artifacts
+*.o
+*.bc
+*.opt
+*.S
+*.debug.o
+*.so
+*.a
+ratan_loader
+ratan_prober
+ratan_probe_responder
+ratan_telemetryd
+ratan_classifier.ko
+
+# generated headers
+vmlinux.h
+*.skel.h
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.mypy_cache/
+.pytest_cache/
+
+# debian build
+debian/.debhelper/
+debian/files
+debian/*.substvars
+debian/*.log
+debian/tmp/
+*.deb
+*.buildinfo
+*.changes
+*.dsc
+*.tar.*
+build/
+
+# editors
+*.swp
+.vscode/
+.idea/

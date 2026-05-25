@@ -1,0 +1,47 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0
+#
+# procd init for ratan-classifier. Starts after ratan-telemetry (which
+# provides the SSE source) and ratan-sched (which pins the BPF map).
+
+START=85
+STOP=15
+USE_PROCD=1
+
+PROG="/usr/sbin/ratan-classifier"
+CONFIG="/etc/ratan/classifier.json"
+
+start_service() {
+	[ -f "$CONFIG" ] || {
+		logger -t ratan-classifier "FATAL: $CONFIG missing"
+		return 1
+	}
+
+	# Wait briefly for the telemetry HTTP and BPF map to come up
+	# (telemetry init is START=65, ratan-sched is START=70).
+	local tries=20
+	while [ $tries -gt 0 ]; do
+		if curl -sf -o /dev/null --connect-timeout 1 \
+		     http://127.0.0.1:9180/healthz 2>/dev/null; then
+			break
+		fi
+		sleep 0.25
+		tries=$((tries - 1))
+	done
+
+	procd_open_instance
+	procd_set_param command "$PROG" --config "$CONFIG" --foreground
+	procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-0}
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file "$CONFIG"
+	procd_close_instance
+}
+
+stop_service() {
+	:
+}
+
+service_triggers() {
+	procd_add_reload_trigger "ratan-classifier"
+}

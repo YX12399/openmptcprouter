@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>RATAN · Sessions</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="ratan.css" />
+  <style>
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 2px 7px;
+      border-radius: 3px;
+      border: 1px solid var(--line-2);
+      background: var(--surface-2);
+      color: var(--fg-1);
+    }
+    .status-pill::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--fg-3); }
+    .status-pill.recording { color: var(--down); border-color: rgba(240,100,100,0.25); background: var(--down-bg); }
+    .status-pill.recording::before { background: var(--down); animation: pulse 1.5s ease-in-out infinite; }
+    .status-pill.completed { color: var(--healthy); border-color: rgba(62,207,142,0.25); background: var(--healthy-bg); }
+    .status-pill.completed::before { background: var(--healthy); }
+
+    .session-form {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      background: var(--bg-1);
+    }
+    .session-form input {
+      background: var(--surface);
+      border: 1px solid var(--line-2);
+      border-radius: var(--r-sm);
+      padding: 6px 10px;
+      color: var(--fg);
+      font-family: var(--mono);
+      font-size: 12px;
+      outline: none;
+      flex: 1;
+      max-width: 320px;
+    }
+    .session-form input:focus { border-color: var(--accent-dim); }
+    .session-form label { font-family: var(--mono); font-size: 11px; color: var(--fg-2); }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .summary-grid > div {
+      padding: 14px 18px;
+      border-right: 1px solid var(--line);
+    }
+    .summary-grid > div:last-child { border-right: 0; }
+    .summary-grid h4 {
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--fg-2);
+      font-weight: 500;
+      margin-bottom: 10px;
+    }
+    .summary-grid .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 3px 0;
+    }
+    .summary-grid .row .k { color: var(--fg-2); }
+    .summary-grid .row .v { color: var(--fg); font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <div id="nav-slot" data-screen-label="03 Sessions"></div>
+
+  <main class="page">
+    <header class="page-head">
+      <div>
+        <div class="page-title">Sessions</div>
+        <div class="page-sub">recordings · timeline → downloadable JSON</div>
+      </div>
+      <div class="page-head-actions">
+        <button class="btn primary" id="open-new">+ Start new session</button>
+      </div>
+    </header>
+
+    <section class="card">
+      <div class="session-form" id="new-form" style="display:none;">
+        <label>name</label>
+        <input id="new-name" placeholder="e.g. jlr_demo_drive_02" />
+        <label>metadata</label>
+        <input id="new-meta" placeholder='{"driver":"rohan","route":"loop"}' />
+        <button class="btn primary" id="start-btn">Start</button>
+        <button class="btn ghost" id="cancel-btn">Cancel</button>
+      </div>
+
+      <table class="table" id="sessions-table">
+        <thead>
+          <tr>
+            <th style="width:60px;">id</th>
+            <th>name</th>
+            <th style="width:130px;">status</th>
+            <th class="mono" style="width:180px;">started</th>
+            <th class="mono" style="width:120px;">duration</th>
+            <th style="width:260px; text-align:right;">actions</th>
+          </tr>
+        </thead>
+        <tbody id="sessions-body"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <!-- Details modal ------------------------------------------------------- -->
+  <div class="modal-backdrop" id="modal">
+    <div class="modal">
+      <div class="modal-head">
+        <div>
+          <div class="modal-title" id="modal-title">Session details</div>
+          <div style="font-family: var(--mono); font-size: 11px; color: var(--fg-2); margin-top: 2px;" id="modal-sub"></div>
+        </div>
+        <button class="btn ghost" id="modal-close">esc</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-foot">
+        <button class="btn" id="modal-download">Download JSON</button>
+        <button class="btn primary" id="modal-done">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="ratan.js"></script>
+  <script>
+    RATAN.mountNav('sessions');
+    const { STATE, fmt, highlightJSON } = RATAN;
+
+    const body = document.getElementById('sessions-body');
+
+    function statusPill(s) { return `<span class="status-pill ${s}">${s}</span>`; }
+
+    function rowFor(s) {
+      const dur = (s.ended_ns ? s.ended_ns : Date.now()*1e6) - s.started_ns;
+      const startedAt = new Date(s.started_ns / 1e6);
+      const startedTxt = startedAt.toLocaleString('en-US', { hour12: false }).replace(',', '');
+      return `<tr data-id="${s.id}">
+        <td class="mono"><span style="color:var(--fg-3);">#</span>${s.id}</td>
+        <td>
+          <div style="font-weight:500; color: var(--fg);">${s.name}</div>
+          <div style="font-family:var(--mono); font-size:10px; color: var(--fg-3); margin-top:1px;">recording · samples · state · weights · injects</div>
+        </td>
+        <td>${statusPill(s.status)}</td>
+        <td class="mono" style="color:var(--fg-1);">${startedTxt}</td>
+        <td class="mono">${fmt.dur(dur/1e6)}</td>
+        <td>
+          <div class="row-actions">
+            <button class="btn sm" data-act="download">Download</button>
+            <button class="btn sm" data-act="details">Details</button>
+            ${s.status === 'recording'
+              ? '<button class="btn sm danger" data-act="stop">Stop</button>'
+              : '<button class="btn sm danger" data-act="delete">Delete</button>'}
+          </div>
+        </td>
+      </tr>`;
+    }
+
+    function render() {
+      body.innerHTML = STATE.sessions
+        .slice()
+        .sort((a, b) => b.started_ns - a.started_ns)
+        .map(rowFor)
+        .join('');
+    }
+    render();
+
+    // tick durations while page is open
+    setInterval(() => {
+      // only update the duration cells in-place for recordings
+      body.querySelectorAll('tr').forEach(tr => {
+        const id = +tr.dataset.id;
+        const s = STATE.sessions.find(x => x.id === id);
+        if (!s || s.status !== 'recording') return;
+        const dur = Date.now()*1e6 - s.started_ns;
+        tr.children[4].textContent = fmt.dur(dur/1e6);
+      });
+    }, 1000);
+
+    // ---- new form ------
+    const form = document.getElementById('new-form');
+    document.getElementById('open-new').addEventListener('click', () => form.style.display = 'flex');
+    document.getElementById('cancel-btn').addEventListener('click', () => form.style.display = 'none');
+    document.getElementById('start-btn').addEventListener('click', async () => {
+      const name = (document.getElementById('new-name').value || '').trim() || `session_${Date.now()}`;
+      let meta = {};
+      const raw = (document.getElementById('new-meta').value || '').trim();
+      if (raw) { try { meta = JSON.parse(raw); } catch { meta = { note: raw }; } }
+      try {
+        await RATAN.api.startSession(name, meta);
+      } catch (e) {
+        alert('Could not start session: ' + e.message);
+        return;
+      }
+      form.style.display = 'none';
+      document.getElementById('new-name').value = '';
+      document.getElementById('new-meta').value = '';
+      render();
+    });
+    if (new URLSearchParams(location.search).get('new') === '1') {
+      form.style.display = 'flex';
+      document.getElementById('new-name').focus();
+    }
+
+    // ---- row actions ------
+    body.addEventListener('click', async e => {
+      const btn = e.target.closest('button[data-act]');
+      if (!btn) return;
+      const tr = btn.closest('tr');
+      const id = +tr.dataset.id;
+      const s = STATE.sessions.find(x => x.id === id);
+      if (!s) return;
+      const act = btn.dataset.act;
+      try {
+        if (act === 'stop') {
+          await RATAN.api.stopSession(id);
+          render();
+        } else if (act === 'delete') {
+          if (!confirm(`Delete session "${s.name}"?`)) return;
+          await RATAN.api.deleteSession(id);
+          render();
+        } else if (act === 'download') {
+          // direct browser download via the API URL
+          window.location.href = RATAN.api.downloadSessionUrl(id);
+        } else if (act === 'details') {
+          openModal(s);
+        }
+      } catch (err) {
+        alert(`${act} failed: ${err.message}`);
+      }
+    });
+
+    function buildSummary(s) {
+      const elapsed_s = ((s.ended_ns || Date.now()*1e6) - s.started_ns) / 1e9;
+      return {
+        id: s.id,
+        name: s.name,
+        status: s.status,
+        metadata: s.metadata || {},
+        summary: {
+          duration_s: +elapsed_s.toFixed(2),
+          per_wan: STATE.wans.map(w => ({
+            wan: w.wan,
+            iface: w.iface,
+            samples: Math.floor(elapsed_s * 2),
+            loss: Math.max(0, Math.floor(elapsed_s * 0.04)),
+            failover: 0,
+            rtt_us_avg: Math.round(w.rttHist.reduce((a,b)=>a+b,0) / Math.max(1,w.rttHist.length)),
+            rtt_us_max: Math.round(Math.max(...w.rttHist)),
+            rtt_us_min: Math.round(Math.min(...w.rttHist)),
+            jitter_us_avg: Math.round(w.jitter_us),
+            bytes_total: Math.round(elapsed_s * w.bps),
+          })),
+          state_transitions: STATE.counters.state_transitions,
+          weight_changes: STATE.counters.weight_changes,
+          handover_events: STATE.wans[0].handover.events_total,
+          mos_avg: 4.21,
+        },
+      };
+    }
+
+    function downloadSession(s) {
+      const payload = Object.assign(buildSummary(s), {
+        samples: [], // omitted in client-side mock
+        state_transitions: [],
+        weights: [],
+        injects: [],
+      });
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `ratan-session-${s.id}-${s.name}.json`;
+      a.click();
+    }
+
+    // ---- modal ------
+    const modal = document.getElementById('modal');
+    let modalSession = null;
+    function openModal(s) {
+      modalSession = s;
+      document.getElementById('modal-title').textContent = `Session #${s.id} · ${s.name}`;
+      const elapsed_s = ((s.ended_ns || Date.now()*1e6) - s.started_ns) / 1e9;
+      document.getElementById('modal-sub').textContent =
+        `${s.status} · ${fmt.dur(elapsed_s*1000)} · started ${new Date(s.started_ns/1e6).toLocaleString('en-US', {hour12:false})}`;
+      const sum = buildSummary(s);
+
+      // split: top half summary cards, bottom half raw json
+      const html = `
+        <div class="summary-grid">
+          <div>
+            <h4>per-wan · wan_starlink</h4>
+            ${Object.entries(sum.summary.per_wan[0]).map(([k,v]) =>
+              `<div class="row"><span class="k">${k}</span><span class="v">${typeof v === 'number' ? fmt.int(v) : v}</span></div>`).join('')}
+          </div>
+          <div>
+            <h4>per-wan · wan_lte</h4>
+            ${Object.entries(sum.summary.per_wan[1]).map(([k,v]) =>
+              `<div class="row"><span class="k">${k}</span><span class="v">${typeof v === 'number' ? fmt.int(v) : v}</span></div>`).join('')}
+          </div>
+        </div>
+        <div class="code-block">${highlightJSON(sum)}</div>
+      `;
+      document.getElementById('modal-body').innerHTML = html;
+      modal.classList.add('open');
+    }
+    function closeModal() { modal.classList.remove('open'); modalSession = null; }
+    document.getElementById('modal-close').addEventListener('click', closeModal);
+    document.getElementById('modal-done').addEventListener('click', closeModal);
+    document.getElementById('modal-download').addEventListener('click', () => modalSession && downloadSession(modalSession));
+    modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+  </script>
+</body>
+</html>

@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>RATAN · Live</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="ratan.css" />
+  <style>
+    .filter-bar {
+      display: flex;
+      gap: 4px;
+      flex-wrap: wrap;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--line);
+      background: var(--bg-1);
+      align-items: center;
+    }
+    .filter-bar .left { display: flex; gap: 4px; flex: 1; flex-wrap: wrap; }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 8px;
+      font-family: var(--mono);
+      font-size: 11px;
+      border-radius: 3px;
+      border: 1px solid var(--line-2);
+      background: var(--surface);
+      color: var(--fg-2);
+      cursor: pointer;
+      user-select: none;
+      transition: color 80ms, border-color 80ms;
+    }
+    .chip .swatch { width: 6px; height: 6px; border-radius: 50%; }
+    .chip.on { color: var(--fg); border-color: var(--line-3); background: var(--surface-2); }
+    .chip.off { opacity: 0.5; }
+    .chip[data-kind="sample"]   .swatch { background: var(--k-sample); }
+    .chip[data-kind="state"]    .swatch { background: var(--k-state); }
+    .chip[data-kind="weight"]   .swatch { background: var(--k-weight); }
+    .chip[data-kind="flow"]     .swatch { background: var(--k-flow); }
+    .chip[data-kind="mos"]      .swatch { background: var(--k-mos); }
+    .chip[data-kind="discovery"].swatch { background: var(--k-discovery); }
+    .chip[data-kind="inject"]   .swatch { background: var(--k-inject); }
+
+    .stream-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--fg-2);
+    }
+    .stream-rate {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 3px;
+      background: var(--bg-1);
+      border: 1px solid var(--line);
+    }
+    .stream-rate .n { color: var(--fg); font-size: 12px; }
+
+    .rate-graph {
+      display: flex;
+      align-items: flex-end;
+      gap: 2px;
+      height: 22px;
+      padding: 2px 0;
+    }
+    .rate-graph .bar {
+      width: 3px;
+      background: var(--accent);
+      opacity: 0.65;
+      border-radius: 1px;
+      min-height: 1px;
+      transition: height 200ms;
+    }
+  </style>
+</head>
+<body>
+  <div id="nav-slot" data-screen-label="02 Live"></div>
+
+  <main class="page">
+    <header class="page-head">
+      <div>
+        <div class="page-title">Live</div>
+        <div class="page-sub">/stream · server-sent events · last 600 rolling</div>
+      </div>
+      <div class="page-head-actions">
+        <label class="switch">
+          <input type="checkbox" id="autoscroll" checked />
+          <span class="switch-track"></span>
+          <span>auto-scroll</span>
+        </label>
+        <label class="switch">
+          <input type="checkbox" id="live-toggle" checked />
+          <span class="switch-track"></span>
+          <span>live</span>
+        </label>
+        <button class="btn" id="clear-btn">Clear</button>
+        <button class="btn" id="export-btn">Export NDJSON</button>
+      </div>
+    </header>
+
+    <!-- KPI strip ---------------------------------------------------------- -->
+    <section class="kpi-strip" id="kpi-strip">
+      <div class="kpi"><div class="kpi-label">samples</div><div class="kpi-value" data-k="samples_total">—</div><div class="kpi-delta">+<span data-rate>0</span>/s</div></div>
+      <div class="kpi"><div class="kpi-label">losses</div><div class="kpi-value" data-k="samples_loss">—</div><div class="kpi-delta">cumulative</div></div>
+      <div class="kpi"><div class="kpi-label">failovers</div><div class="kpi-value" data-k="samples_failover">—</div><div class="kpi-delta">fast path</div></div>
+      <div class="kpi"><div class="kpi-label">state Δ</div><div class="kpi-value" data-k="state_transitions">—</div><div class="kpi-delta">all wans</div></div>
+      <div class="kpi"><div class="kpi-label">flow events</div><div class="kpi-value" data-k="flow_events">—</div><div class="kpi-delta">ndpi</div></div>
+      <div class="kpi"><div class="kpi-label">mos samples</div><div class="kpi-value" data-k="mos_events">—</div><div class="kpi-delta">videocall</div></div>
+      <div class="kpi"><div class="kpi-label">discovery</div><div class="kpi-value" data-k="discovery_events">—</div><div class="kpi-delta">neighbors</div></div>
+      <div class="kpi"><div class="kpi-label">sse subs</div><div class="kpi-value" data-k="sse_clients">—</div><div class="kpi-delta">/stream</div></div>
+    </section>
+
+    <!-- Event stream ------------------------------------------------------- -->
+    <section class="card">
+      <div class="filter-bar">
+        <div class="left" id="filter-chips">
+          <span class="chip on" data-kind="sample"><span class="swatch"></span> sample</span>
+          <span class="chip on" data-kind="state"><span class="swatch"></span> state</span>
+          <span class="chip on" data-kind="weight"><span class="swatch"></span> weight</span>
+          <span class="chip on" data-kind="flow"><span class="swatch"></span> flow</span>
+          <span class="chip on" data-kind="mos"><span class="swatch"></span> mos</span>
+          <span class="chip on" data-kind="discovery"><span class="swatch"></span> discovery</span>
+          <span class="chip on" data-kind="inject"><span class="swatch"></span> inject</span>
+        </div>
+        <input id="search" placeholder="filter · key=value · regex ok"
+               style="background: var(--bg-1); border: 1px solid var(--line-2); border-radius: 4px;
+                      padding: 5px 10px; color: var(--fg); font-family: var(--mono); font-size: 11px; width: 240px;
+                      outline: none;" />
+      </div>
+
+      <div class="stream-toolbar">
+        <span>rate</span>
+        <span class="stream-rate"><span class="n" id="rate-n">0</span><span>ev/s</span></span>
+        <div class="rate-graph" id="rate-graph"></div>
+        <span style="flex:1;"></span>
+        <span><span id="visible-count">0</span> visible · <span id="total-count">0</span> total in ring</span>
+        <span style="color:var(--fg-3);">·</span>
+        <span>filter: <span id="filter-summary" style="color:var(--fg);">all kinds</span></span>
+      </div>
+
+      <div class="eventlog" id="log"></div>
+    </section>
+  </main>
+
+  <script src="ratan.js"></script>
+  <script>
+    RATAN.mountNav('live');
+    const { bus, STATE, fmt } = RATAN;
+
+    // ---- KPI strip ------
+    const kpiEls = {};
+    document.querySelectorAll('#kpi-strip [data-k]').forEach(el => kpiEls[el.dataset.k] = el);
+    let prevSamples = STATE.counters.samples_total;
+    function renderKPIs() {
+      kpiEls.samples_total.textContent = fmt.int(STATE.counters.samples_total);
+      kpiEls.samples_loss.textContent  = fmt.int(STATE.counters.samples_loss);
+      kpiEls.samples_failover.textContent = fmt.int(STATE.counters.samples_failover);
+      kpiEls.state_transitions.textContent = fmt.int(STATE.counters.state_transitions);
+      kpiEls.flow_events.textContent  = fmt.int(STATE.counters.flow_events);
+      kpiEls.mos_events.textContent   = fmt.int(STATE.counters.mos_events);
+      kpiEls.discovery_events.textContent = fmt.int(STATE.counters.discovery_events);
+      kpiEls.sse_clients.textContent  = STATE.counters.sse_clients;
+      const delta = STATE.counters.samples_total - prevSamples;
+      prevSamples = STATE.counters.samples_total;
+      document.querySelector('[data-rate]').textContent = delta * 2;
+    }
+    renderKPIs();
+
+    // ---- filters ------
+    const enabled = new Set(['sample','state','weight','flow','mos','discovery','inject']);
+    const filterChips = document.getElementById('filter-chips');
+    filterChips.addEventListener('click', e => {
+      const chip = e.target.closest('.chip');
+      if (!chip) return;
+      const k = chip.dataset.kind;
+      if (enabled.has(k)) { enabled.delete(k); chip.classList.replace('on', 'off'); }
+      else { enabled.add(k); chip.classList.replace('off', 'on'); }
+      document.getElementById('filter-summary').textContent =
+        enabled.size === 7 ? 'all kinds' : [...enabled].join(', ') || 'none';
+      rerender();
+    });
+
+    // ---- event log ------
+    const log = document.getElementById('log');
+    const autoScrollEl = document.getElementById('autoscroll');
+    let live = true;
+    document.getElementById('live-toggle').addEventListener('change', e => live = e.target.checked);
+    const searchEl = document.getElementById('search');
+    searchEl.addEventListener('input', () => rerender());
+
+    function fmtEvent(ev) {
+      const d = new Date(ev.ts_ns / 1e6);
+      const ts = fmt.ts(d);
+      let body = '';
+      switch (ev.kind) {
+        case 'sample':
+          body = `<span class="k">wan</span><span class="v wan">${ev.wan}</span> <span class="k">rtt</span><span class="v">${(ev.rtt_us/1000).toFixed(1)}ms</span> <span class="k">jit</span><span class="v">${(ev.jitter_us/1000).toFixed(1)}ms</span> <span class="k">loss</span><span class="v">${ev.loss}</span> <span class="k">seq</span><span class="v">${ev.seq}</span>`;
+          break;
+        case 'state':
+          body = `<span class="k">wan</span><span class="v wan">${ev.wan}</span> <span class="v">${ev.from}</span> <span class="k">→</span> <span class="v">${ev.to}</span> <span class="k">reason</span><span class="v">${ev.reason}</span>`;
+          break;
+        case 'weight':
+          body = `<span class="k">wan</span><span class="v wan">${ev.wan}</span> <span class="k">w=</span><span class="v">${ev.weight}</span> <span class="k">src</span><span class="v">${ev.source}</span>`;
+          break;
+        case 'flow':
+          body = `<span class="k">${ev.event}</span> <span class="v">${ev.five_tuple}</span> <span class="k">cat</span><span class="v">${ev.category}</span> <span class="k">mark</span><span class="v">${ev.mark}</span>`;
+          break;
+        case 'mos':
+          body = `<span class="k">wan</span><span class="v wan">${ev.wan}</span> <span class="k">mos</span><span class="v">${ev.mos}</span> <span class="k">r</span><span class="v">${ev.r}</span> <span class="k">rtt</span><span class="v">${ev.rtt_ms}ms</span> <span class="k">loss</span><span class="v">${ev.loss_pct}%</span> <span class="k">jit</span><span class="v">${ev.jitter_ms}ms</span>`;
+          break;
+        case 'discovery':
+          body = `<span class="k">${ev.sub}</span> <span class="v">${ev.detail}</span>`;
+          break;
+        case 'inject':
+          body = `<span class="k">session</span><span class="v">${ev.session}</span> <span class="k">action</span><span class="v">${ev.action}</span> <span class="k">target</span><span class="v">${ev.target}</span> <span class="k">detail</span><span class="v">${ev.detail}</span>`;
+          break;
+        default:
+          body = `<span class="v">${JSON.stringify(ev)}</span>`;
+      }
+      return `<div class="event-row" data-kind="${ev.kind}">
+        <span class="event-ts">${ts}</span>
+        <span class="event-kind ${ev.kind}">${ev.kind}</span>
+        <span class="event-body">${body}</span>
+      </div>`;
+    }
+
+    function passesFilters(ev) {
+      if (!enabled.has(ev.kind)) return false;
+      const q = searchEl.value.trim();
+      if (!q) return true;
+      try {
+        const re = new RegExp(q, 'i');
+        return re.test(JSON.stringify(ev));
+      } catch {
+        return JSON.stringify(ev).toLowerCase().includes(q.toLowerCase());
+      }
+    }
+
+    // initial render
+    function rerender() {
+      const items = STATE.events.filter(passesFilters).slice(-300);
+      log.innerHTML = items.map(fmtEvent).join('');
+      document.getElementById('visible-count').textContent = items.length;
+      document.getElementById('total-count').textContent = STATE.events.length;
+      if (autoScrollEl.checked) log.scrollTop = log.scrollHeight;
+    }
+    rerender();
+
+    // incremental on new event
+    let pendingFrame = null;
+    bus.on('event', (ev) => {
+      if (!live) return;
+      if (!passesFilters(ev)) {
+        document.getElementById('total-count').textContent = STATE.events.length;
+        return;
+      }
+      log.insertAdjacentHTML('beforeend', fmtEvent(ev));
+      // trim DOM if over 300
+      while (log.children.length > 300) log.firstElementChild.remove();
+      if (autoScrollEl.checked) log.scrollTop = log.scrollHeight;
+      document.getElementById('visible-count').textContent = log.children.length;
+      document.getElementById('total-count').textContent = STATE.events.length;
+    });
+
+    // ---- rate graph ------
+    const rateGraph = document.getElementById('rate-graph');
+    const rateHist = Array(40).fill(0);
+    let rateAccum = 0;
+    bus.on('event', () => rateAccum++);
+    setInterval(() => {
+      rateHist.push(rateAccum);
+      if (rateHist.length > 40) rateHist.shift();
+      const max = Math.max(...rateHist, 1);
+      rateGraph.innerHTML = rateHist.map(v =>
+        `<span class="bar" style="height:${(v/max*22).toFixed(1)}px"></span>`).join('');
+      document.getElementById('rate-n').textContent = rateAccum;
+      rateAccum = 0;
+    }, 1000);
+
+    bus.on('tick', () => { if (live) renderKPIs(); });
+
+    document.getElementById('clear-btn').addEventListener('click', () => {
+      STATE.events.length = 0;
+      log.innerHTML = '';
+      document.getElementById('visible-count').textContent = 0;
+      document.getElementById('total-count').textContent = 0;
+    });
+    document.getElementById('export-btn').addEventListener('click', () => {
+      const blob = new Blob(STATE.events.map(e => JSON.stringify(e) + '\n'), { type: 'application/x-ndjson' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'ratan-stream-' + Date.now() + '.ndjson';
+      a.click();
+    });
+  </script>
+</body>
+</html>

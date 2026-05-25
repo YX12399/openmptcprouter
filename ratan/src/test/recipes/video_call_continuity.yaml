@@ -1,0 +1,56 @@
+# Video-call survival test -- the headline JLR demo scenario.
+#
+# Runs for 3 minutes during which a Teams/Zoom/Meet call should
+# be active on the LAN. We simulate three Starlink-handover-shaped
+# blips at the natural ~15s cadence, then a 5-second obstruction.
+# The classifier (Step 5) should keep Starlink in TRANSIENT during
+# the blips (no thrash); the QoS layer (Step 8) + Glorytun-UDP-FEC
+# (Step 14) should keep the call MOS >= 3.5.
+#
+# Pass criterion: per-second MOS for the VideoCall/* flow stays
+# >= 3.5 through every inject window. Computed by Step 4b's MOS
+# computer; for now ratan-test just records the raw timeline.
+
+name: video_call_continuity
+description: "Video call survives 3 Starlink handovers + 1 obstruction"
+duration: 180s
+
+metadata:
+  test_type: video_call_survival
+  pass_criteria:
+    - "MOS >= 3.5 for VideoCall/* flow throughout"
+    - "no audio dropout > 100ms"
+  required_flow_category: "VideoCall/*"
+
+injects:
+  # Three handover-shaped blips at the natural 15s cadence
+  - at: 30s
+    action: netem_blip
+    target: wan0
+    duration: 200ms
+    loss: 100
+  - at: 45s
+    action: netem_blip
+    target: wan0
+    duration: 250ms
+    loss: 100
+  - at: 60s
+    action: netem_blip
+    target: wan0
+    duration: 300ms
+    loss: 100
+
+  # Sustained obstruction (5s) -- this should trigger DEGRADING -> DOWN
+  - at: 90s
+    action: netem_drop
+    target: wan0
+  - at: 95s
+    action: netem_restore
+    target: wan0
+
+  # Verify recovery: another natural-cadence blip after restoration
+  - at: 150s
+    action: netem_blip
+    target: wan0
+    duration: 200ms
+    loss: 100

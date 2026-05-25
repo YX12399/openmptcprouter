@@ -1,0 +1,21 @@
+# Passive 10-minute baseline recording of Starlink behaviour.
+#
+# No injects -- we let real Starlink do real Starlink things and
+# capture the natural loss-event time series. Used by Step 9 (the
+# handover phase tracker) to learn the per-session ~15s cadence.
+#
+# Pass criterion: at least 30 loss events on wan0 over the 10 min
+# window (enough for an autocorrelation lock). Inspect the exported
+# session.json's samples table.
+
+name: starlink_baseline
+description: "Passive 10-min Starlink recording for handover-cadence learning"
+duration: 600s
+
+metadata:
+  test_type: passive_baseline
+  use_in:
+    - "Step 9 handover phase tracker training"
+    - "manual histogram inspection"
+
+injects: []

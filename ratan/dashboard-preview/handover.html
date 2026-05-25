@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>RATAN · Handover predictor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="ratan.css" />
+  <style>
+    .phase-clock {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 1;
+      max-width: 220px;
+      margin: 0 auto;
+    }
+    .phase-clock svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+    .phase-clock-center {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--mono);
+    }
+    .phase-clock-center .big {
+      font-size: 32px;
+      font-weight: 500;
+      letter-spacing: -0.02em;
+      color: var(--fg);
+      font-variant-numeric: tabular-nums;
+    }
+    .phase-clock-center .big .unit { font-size: 14px; color: var(--fg-2); margin-left: 2px; }
+    .phase-clock-center .lbl {
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--fg-2);
+      margin-top: 2px;
+    }
+
+    /* RTT spike trace */
+    .rtt-trace {
+      height: 110px;
+      background: var(--bg-1);
+      border: 1px solid var(--line);
+      border-radius: var(--r-sm);
+      position: relative;
+      overflow: hidden;
+    }
+    .rtt-trace canvas { display: block; width: 100%; height: 100%; }
+    .rtt-trace-gridline {
+      position: absolute;
+      left: 0;
+      right: 0;
+      height: 1px;
+      background: rgba(255,255,255,0.04);
+    }
+    .rtt-trace-label {
+      position: absolute;
+      font-family: var(--mono);
+      font-size: 9px;
+      color: var(--fg-3);
+      padding: 1px 4px;
+      background: var(--bg-1);
+    }
+
+    /* Wide handover timeline */
+    .handover-timeline {
+      position: relative;
+      padding: 28px 16px 28px;
+      background: var(--bg-1);
+      border: 1px solid var(--line);
+      border-radius: var(--r-sm);
+    }
+    .ht-axis {
+      position: absolute;
+      left: 16px;
+      right: 16px;
+      top: 50%;
+      height: 2px;
+      background: var(--line-2);
+      border-radius: 1px;
+    }
+    .ht-tick {
+      position: absolute;
+      top: 50%;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+      border: 2px solid var(--bg-1);
+      transition: all 200ms;
+    }
+    .ht-tick.hit { background: var(--healthy); box-shadow: 0 0 12px rgba(62,207,142,0.5); }
+    .ht-tick.miss { background: var(--down); box-shadow: 0 0 12px rgba(240,100,100,0.5); }
+    .ht-tick-label {
+      position: absolute;
+      top: calc(50% + 14px);
+      transform: translateX(-50%);
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--fg-3);
+      white-space: nowrap;
+    }
+    .ht-tick-rtt {
+      position: absolute;
+      top: calc(50% - 26px);
+      transform: translateX(-50%);
+      font-family: var(--mono);
+      font-size: 9px;
+      color: var(--fg-2);
+      white-space: nowrap;
+    }
+    .ht-now {
+      position: absolute;
+      top: 6px;
+      bottom: 6px;
+      width: 1px;
+      background: var(--accent);
+      box-shadow: 0 0 8px var(--accent);
+    }
+    .ht-now::before {
+      content: 'now';
+      position: absolute;
+      top: -2px;
+      left: 4px;
+      font-family: var(--mono);
+      font-size: 9px;
+      color: var(--accent);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    /* Stats bar */
+    .stat-rail {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 0;
+    }
+    .stat-rail > div {
+      padding: 12px 14px;
+      border-right: 1px solid var(--line);
+    }
+    .stat-rail > div:last-child { border-right: 0; }
+    @media (max-width: 768px) {
+      .stat-rail { grid-template-columns: repeat(3, 1fr); }
+      .stat-rail > div:nth-child(3n) { border-right: 0; }
+      .stat-rail > div:nth-child(n+4) { border-top: 1px solid var(--line); }
+    }
+
+    .armed-banner {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 14px;
+      background: linear-gradient(90deg, rgba(240,168,38,0.18), rgba(240,168,38,0.05));
+      border-left: 2px solid var(--degrading);
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--degrading);
+    }
+    .armed-banner.on { display: flex; }
+    .armed-banner::before {
+      content: '';
+      width: 8px; height: 8px; border-radius: 50%; background: var(--degrading);
+      box-shadow: 0 0 8px var(--degrading);
+      animation: pulse 0.8s ease-in-out infinite;
+    }
+
+    .legend {
+      display: flex;
+      gap: 14px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--fg-2);
+      align-items: center;
+    }
+    .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+    .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+  </style>
+</head>
+<body>
+  <div id="nav-slot" data-screen-label="04 Handover predictor"></div>
+
+  <main class="page">
+    <header class="page-head">
+      <div>
+        <div class="page-title">Handover predictor</div>
+        <div class="page-sub">leo phase tracker · static: /ratan-data/handover-status.json</div>
+      </div>
+      <div class="page-head-actions">
+        <span style="font-family:var(--mono); font-size:11px; color:var(--fg-2);">
+          poll <span style="color:var(--fg);">1.0s</span>
+        </span>
+        <label class="switch">
+          <input type="checkbox" id="live-toggle" checked />
+          <span class="switch-track"></span>
+          <span>live</span>
+        </label>
+      </div>
+    </header>
+
+    <div class="rationale">
+      <b>What you're looking at.</b>
+      Starlink LEO satellites hand off the user terminal to a new bird roughly every 15 seconds. Each handover
+      manifests as a sharp RTT spike + brief loss. We learn the interval (median + CoV), arm the predictor a
+      couple seconds before the next predicted spike, and pre-shift weight to the cellular WAN so the user
+      never feels the seam. The phase clock on the left counts down to the next predicted spike; the
+      timeline below shows the last 20 events — green dots are hits (we armed in time), red are misses.
+      A <b>tight</b> confidence tier means CoV &lt; 0.2 and we trust the prediction; <b>chaotic</b> falls back
+      to reactive switching only.
+    </div>
+
+    <!-- Per-WAN predictor cards ------------------------------------------- -->
+    <section class="grid-2" style="margin-bottom: 16px;">
+      <!-- WAN 0 ====================================================== -->
+      <div class="card" data-wan="0">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Starlink<span class="card-title-sub">wan_starlink · LEO phase tracker</span></div>
+            <div style="font-family:var(--mono); font-size:11px; color:var(--fg-2); margin-top:3px;">
+              tracking <span style="color:var(--fg);" data-intervals>20</span> intervals · CoV <span style="color:var(--fg);" data-cov>0.18</span>
+            </div>
+          </div>
+          <div class="badge tight" data-conf>tight</div>
+        </div>
+
+        <div class="armed-banner" data-armed>predictor armed · pre-shifting MPTCP weight to wan_lte</div>
+
+        <div style="display:grid; grid-template-columns: 240px 1fr; gap: 18px; padding: 18px 18px 6px;">
+          <!-- phase clock -->
+          <div>
+            <div class="phase-clock">
+              <svg viewBox="0 0 100 100">
+                <circle cx="50" cy="50" r="44" fill="none" stroke="#1d1f24" stroke-width="6"/>
+                <circle cx="50" cy="50" r="44" fill="none" stroke="url(#g0)" stroke-width="6"
+                        stroke-linecap="round"
+                        stroke-dasharray="276.46" stroke-dashoffset="0"
+                        data-arc style="transition: stroke-dashoffset 200ms linear;"/>
+                <defs>
+                  <linearGradient id="g0" x1="0" x2="1" y1="0" y2="0">
+                    <stop offset="0%" stop-color="#5b9dff"/>
+                    <stop offset="100%" stop-color="#3ecf8e"/>
+                  </linearGradient>
+                </defs>
+              </svg>
+              <div class="phase-clock-center">
+                <div class="big"><span data-next>4.3</span><span class="unit">s</span></div>
+                <div class="lbl">next predicted</div>
+              </div>
+            </div>
+            <div style="text-align:center; font-family:var(--mono); font-size:11px; color:var(--fg-2); margin-top:10px;">
+              phase <span style="color:var(--fg);" data-phase>10.7</span> / <span data-median>15.3</span>s
+            </div>
+          </div>
+
+          <!-- RTT trace -->
+          <div>
+            <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:6px;">
+              <div class="metric-label">RTT · last 60s · handover spikes overlaid</div>
+              <div style="font-family:var(--mono); font-size:10px; color:var(--fg-3);">
+                <span data-rtt-min>22</span>–<span data-rtt-max>48</span>ms
+              </div>
+            </div>
+            <div class="rtt-trace">
+              <canvas data-rtt-canvas></canvas>
+            </div>
+            <div class="legend" style="margin-top: 10px;">
+              <span class="legend-item"><span class="legend-dot" style="background:var(--accent);"></span> rtt</span>
+              <span class="legend-item"><span class="legend-dot" style="background:var(--healthy);"></span> hit</span>
+              <span class="legend-item"><span class="legend-dot" style="background:var(--down);"></span> miss</span>
+              <span class="legend-item"><span class="legend-dot" style="background:var(--degrading); box-shadow:0 0 4px var(--degrading);"></span> armed window</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- stat rail -->
+        <div class="stat-rail" style="border-top: 1px solid var(--line); margin-top: 12px;">
+          <div>
+            <div class="metric-label" style="margin-bottom:4px;">events</div>
+            <div style="font-family:var(--mono); font-size:18px;" data-events>47</div>
+          </div>
+          <div>
+            <div class="metric-label" style="margin-bottom:4px;">intervals</div>
+            <div style="font-family:var(--mono); font-size:18px;" data-int2>20</div>
+          </div>
+          <div>
+            <div class="metric-label" style="margin-bottom:4px;">median</div>
+            <div style="font-family:var(--mono); font-size:18px;"><span data-median2>15.3</span><span style="font-size:11px; color:var(--fg-2);">s</span></div>
+          </div>
+          <div>
+            <div class="metric-label" style="margin-bottom:4px;">CoV</div>
+            <div style="font-family:var(--mono); font-size:18px;" data-cov2>0.18</div>
+          </div>
+          <div>
+            <div class="metric-label" style="margin-bottom:4px;">miss streak</div>
+            <div style="font-family:var(--mono); font-size:18px;" data-miss>0</div>
+          </div>
+          <div>
+            <div class="metric-label" style="margin-bottom:4px;">hit rate</div>
+            <div style="font-family:var(--mono); font-size:18px; color: var(--healthy);" data-hit-rate>92%</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- WAN 1 — terrestrial, no handover cycle ===================== -->
+      <div class="card" data-wan="1">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Cellular<span class="card-title-sub">wan_lte · band 71</span></div>
+            <div style="font-family:var(--mono); font-size:11px; color:var(--fg-2); margin-top:3px;">
+              tower handovers not predicted · terrestrial
+            </div>
+          </div>
+          <div class="badge cold">cold</div>
+        </div>
+
+        <div style="padding: 18px;">
+          <div style="background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 20px 18px;">
+            <div class="metric-label" style="margin-bottom: 12px;">cell · serving</div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px 24px; font-family: var(--mono); font-size: 12px;">
+              <div><span style="color:var(--fg-2);">eNB</span> <span style="color:var(--fg);">281104201</span></div>
+              <div><span style="color:var(--fg-2);">PCI</span> <span style="color:var(--fg);">412</span></div>
+              <div><span style="color:var(--fg-2);">RSRP</span> <span style="color:var(--fg);">−92 dBm</span></div>
+              <div><span style="color:var(--fg-2);">SINR</span> <span style="color:var(--healthy);">14.3 dB</span></div>
+              <div><span style="color:var(--fg-2);">band</span> <span style="color:var(--fg);">B71 (600MHz)</span></div>
+              <div><span style="color:var(--fg-2);">EARFCN</span> <span style="color:var(--fg);">68986</span></div>
+            </div>
+          </div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-top: 14px;">
+            <div style="padding: 12px; background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-sm);">
+              <div class="metric-label" style="margin-bottom: 4px;">handovers / hr</div>
+              <div style="font-family:var(--mono); font-size: 18px;">0.4</div>
+            </div>
+            <div style="padding: 12px; background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-sm);">
+              <div class="metric-label" style="margin-bottom: 4px;">last seen</div>
+              <div style="font-family:var(--mono); font-size: 18px;">2h 11m</div>
+            </div>
+            <div style="padding: 12px; background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-sm);">
+              <div class="metric-label" style="margin-bottom: 4px;">mode</div>
+              <div style="font-family:var(--mono); font-size: 14px; color: var(--fg-2);">reactive</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Wide handover history timeline ------------------------------------ -->
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">Handover history <span class="card-title-sub">wan_starlink · last 20 events · oldest → newest</span></div>
+        </div>
+        <div class="legend">
+          <span class="legend-item"><span class="legend-dot" style="background:var(--healthy);"></span> hit (armed in time)</span>
+          <span class="legend-item"><span class="legend-dot" style="background:var(--down);"></span> miss</span>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="handover-timeline" id="ht">
+          <div class="ht-axis"></div>
+          <div class="ht-now" id="ht-now" style="left: 92%;"></div>
+        </div>
+        <div style="display:flex; justify-content:space-between; margin-top:10px; font-family:var(--mono); font-size:10px; color:var(--fg-3);">
+          <span>5 min ago</span><span>3 min ago</span><span>1 min ago</span><span>now</span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="ratan.js"></script>
+  <script>
+    RATAN.mountNav('handover');
+    const { bus, STATE } = RATAN;
+
+    // ---- WAN 0 phase clock + stats ------
+    const card0 = document.querySelector('[data-wan="0"]');
+    const arc = card0.querySelector('[data-arc]');
+    const CIRC = 276.46;
+
+    function renderWAN0() {
+      const w = STATE.wans[0];
+      const h = w.handover;
+      const phase = h.median_interval_s - h.next_predicted_in_s;
+
+      card0.querySelector('[data-next]').textContent = h.next_predicted_in_s.toFixed(1);
+      card0.querySelector('[data-phase]').textContent = phase.toFixed(1);
+      card0.querySelector('[data-median]').textContent = h.median_interval_s.toFixed(1);
+      card0.querySelector('[data-median2]').textContent = h.median_interval_s.toFixed(1);
+      card0.querySelector('[data-cov]').textContent = h.cov.toFixed(2);
+      card0.querySelector('[data-cov2]').textContent = h.cov.toFixed(2);
+      card0.querySelector('[data-intervals]').textContent = h.intervals_tracked;
+      card0.querySelector('[data-int2]').textContent = h.intervals_tracked;
+      card0.querySelector('[data-events]').textContent = h.events_total;
+      card0.querySelector('[data-miss]').textContent = h.miss_streak;
+
+      const hits = w.handoverTimeline.filter(t => t.hit).length;
+      const hitRate = w.handoverTimeline.length ? Math.round(hits / w.handoverTimeline.length * 100) : 100;
+      card0.querySelector('[data-hit-rate]').textContent = hitRate + '%';
+
+      // arc fills as phase progresses
+      const frac = Math.min(1, Math.max(0, phase / h.median_interval_s));
+      arc.setAttribute('stroke-dashoffset', (CIRC * (1 - frac)).toFixed(1));
+
+      // armed banner
+      card0.querySelector('[data-armed]').classList.toggle('on', h.currently_armed);
+
+      // confidence badge
+      const conf = card0.querySelector('[data-conf]');
+      conf.textContent = h.confidence;
+      conf.className = 'badge ' + h.confidence;
+
+      // RTT min/max
+      const rtts = w.rttHist.map(u => u/1000);
+      card0.querySelector('[data-rtt-min]').textContent = Math.round(Math.min(...rtts));
+      card0.querySelector('[data-rtt-max]').textContent = Math.round(Math.max(...rtts));
+    }
+
+    // ---- RTT canvas trace ------
+    const rttCanvas = card0.querySelector('[data-rtt-canvas]');
+    function drawRTT() {
+      const w = STATE.wans[0];
+      const cs = rttCanvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      rttCanvas.width = cs.width * dpr;
+      rttCanvas.height = cs.height * dpr;
+      const ctx = rttCanvas.getContext('2d');
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0,0,cs.width,cs.height);
+
+      const data = w.rttHist;
+      const min = Math.min(...data) * 0.95;
+      const max = Math.max(...data) * 1.05;
+      const range = max - min || 1;
+
+      // gridlines
+      ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+      ctx.lineWidth = 1;
+      for (let i = 1; i < 4; i++) {
+        const y = (cs.height / 4) * i;
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(cs.width, y); ctx.stroke();
+      }
+
+      // armed window shading (last 3s if armed)
+      if (w.handover.currently_armed) {
+        const armedStart = cs.width - (3 / 60) * cs.width;
+        ctx.fillStyle = 'rgba(240,168,38,0.08)';
+        ctx.fillRect(armedStart, 0, cs.width - armedStart, cs.height);
+      }
+
+      // area fill
+      ctx.beginPath();
+      data.forEach((v, i) => {
+        const x = (i / (data.length - 1)) * cs.width;
+        const y = cs.height - ((v - min) / range) * cs.height;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.lineTo(cs.width, cs.height);
+      ctx.lineTo(0, cs.height);
+      ctx.closePath();
+      const grad = ctx.createLinearGradient(0, 0, 0, cs.height);
+      grad.addColorStop(0, 'rgba(91,157,255,0.25)');
+      grad.addColorStop(1, 'rgba(91,157,255,0.02)');
+      ctx.fillStyle = grad;
+      ctx.fill();
+
+      // line
+      ctx.beginPath();
+      data.forEach((v, i) => {
+        const x = (i / (data.length - 1)) * cs.width;
+        const y = cs.height - ((v - min) / range) * cs.height;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = '#5b9dff';
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+
+      // overlay spike dots at handover events (last 60s window)
+      const now = Date.now();
+      w.handoverTimeline.forEach(ev => {
+        const ageS = (now - ev.t) / 1000;
+        if (ageS > 60) return;
+        const x = cs.width - (ageS / 60) * cs.width;
+        ctx.beginPath();
+        ctx.arc(x, 8, 3, 0, Math.PI*2);
+        ctx.fillStyle = ev.hit ? '#3ecf8e' : '#f06464';
+        ctx.fill();
+      });
+    }
+
+    // ---- handover history timeline ------
+    const ht = document.getElementById('ht');
+    function renderTimeline() {
+      const w = STATE.wans[0];
+      // clear existing ticks
+      ht.querySelectorAll('.ht-tick, .ht-tick-label, .ht-tick-rtt').forEach(n => n.remove());
+
+      const now = Date.now();
+      const windowMs = 5 * 60 * 1000; // 5 min span
+      w.handoverTimeline.forEach((ev, i) => {
+        const ageMs = now - ev.t;
+        // span from oldest (~5 min ago) to now (right side at 92%)
+        let leftPct = 100 - (ageMs / windowMs) * 100;
+        leftPct = Math.max(2, Math.min(96, leftPct));
+
+        const tick = document.createElement('div');
+        tick.className = 'ht-tick ' + (ev.hit ? 'hit' : 'miss');
+        tick.style.left = leftPct + '%';
+        ht.appendChild(tick);
+
+        // label every 4th
+        if (i % 4 === 0 || i === w.handoverTimeline.length - 1) {
+          const lab = document.createElement('div');
+          lab.className = 'ht-tick-label';
+          lab.style.left = leftPct + '%';
+          const secAgo = Math.round(ageMs / 1000);
+          lab.textContent = secAgo > 60 ? Math.floor(secAgo/60) + 'm ' + (secAgo%60) + 's' : secAgo + 's';
+          ht.appendChild(lab);
+
+          const rtt = document.createElement('div');
+          rtt.className = 'ht-tick-rtt';
+          rtt.style.left = leftPct + '%';
+          rtt.textContent = (28 + Math.random()*20).toFixed(0) + 'ms';
+          ht.appendChild(rtt);
+        }
+      });
+    }
+
+    let live = true;
+    document.getElementById('live-toggle').addEventListener('change', e => live = e.target.checked);
+    bus.on('tick', () => {
+      if (!live) return;
+      renderWAN0();
+      drawRTT();
+      renderTimeline();
+    });
+
+    renderWAN0();
+    drawRTT();
+    renderTimeline();
+    window.addEventListener('resize', drawRTT);
+  </script>
+</body>
+</html>

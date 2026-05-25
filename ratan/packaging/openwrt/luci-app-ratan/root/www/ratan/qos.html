@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: GPL-2.0 -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>RATAN · QoS</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="ratan.css" />
+  <style>
+    .qos-class {
+      padding: 12px 16px;
+      border-top: 1px solid var(--line);
+      display: grid;
+      grid-template-columns: 132px 1fr 160px;
+      gap: 16px;
+      align-items: center;
+    }
+    .qos-class:first-of-type { border-top: 0; }
+
+    .qos-class-head {
+      font-family: var(--mono);
+      font-size: 11px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .qos-class-head .name {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--fg);
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+    .qos-class-head .name.realtime    { color: var(--healthy); }
+    .qos-class-head .name.bulk        { color: var(--transient); }
+    .qos-class-head .name.background  { color: var(--fg-2); }
+    .qos-class-head .handle { color: var(--fg-3); }
+
+    .qos-bar-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .qos-bar {
+      height: 16px;
+      background: var(--bg-1);
+      border: 1px solid var(--line);
+      border-radius: 3px;
+      position: relative;
+      overflow: hidden;
+    }
+    .qos-bar-fill {
+      position: absolute;
+      left: 0; top: 0; bottom: 0;
+      transition: width 250ms;
+    }
+    .qos-bar-fill.realtime   { background: var(--healthy); }
+    .qos-bar-fill.bulk       { background: var(--transient); }
+    .qos-bar-fill.background { background: var(--fg-2); }
+    .qos-bar-floor-line {
+      position: absolute;
+      top: -2px; bottom: -2px; width: 2px;
+      background: var(--fg-3);
+      opacity: 0.6;
+    }
+    .qos-bar-meta {
+      display: flex;
+      justify-content: space-between;
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--fg-3);
+    }
+
+    .qos-stats {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--fg-2);
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      text-align: right;
+    }
+    .qos-stats .v { color: var(--fg); }
+    .qos-stats .drops.bad { color: var(--down); }
+
+    .qos-empty {
+      padding: 28px 16px;
+      text-align: center;
+      color: var(--fg-3);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .qos-empty .hint { color: var(--fg-2); margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div id="nav-slot" data-screen-label="06 QoS"></div>
+
+  <main class="page">
+    <header class="page-head">
+      <div>
+        <div class="page-title">QoS</div>
+        <div class="page-sub">tc htb · realtime / bulk / background · per WAN</div>
+      </div>
+      <div class="page-head-actions">
+        <span style="font-family:var(--mono); font-size:11px; color:var(--fg-2);">
+          poll <span style="color:var(--fg);">2.0s</span>
+        </span>
+        <label class="switch">
+          <input type="checkbox" id="live-toggle" checked />
+          <span class="switch-track"></span>
+          <span>live</span>
+        </label>
+      </div>
+    </header>
+
+    <div class="rationale">
+      <b>What you're looking at.</b>
+      Per-WAN bandwidth shaping. Each WAN has three traffic classes:
+      <span style="color:var(--healthy)">realtime</span> (VideoCall, VoIP) gets a guaranteed floor
+      regardless of what the others are doing; <span style="color:var(--transient)">bulk</span> takes
+      whatever's left; <span style="color:var(--fg-2)">background</span> is capped so it can't push
+      realtime out of its floor. During a WAN drop, the other WAN's tree still honors realtime's
+      floor — that's the "Teams survives the drop while iperf3 absorbs the hit" property.
+      Bars below show <em>current</em> usage; the small notch is the configured floor.
+    </div>
+
+    <div id="content"><div class="qos-empty">loading…</div></div>
+  </main>
+
+  <script src="ratan.js"></script>
+  <script>
+    RATAN.mountNav('qos');
+    const { fmt } = RATAN;
+
+    // remember previous sent_bytes per (wan_id, handle) so we can derive
+    // current bps from delta. Map "wan_id|handle" -> {bytes, ts_ms}
+    const prev = new Map();
+
+    // Map class handle -> friendly name + css color class.
+    function classMeta(handle) {
+      if (handle === '1:10' || handle === '1:10')  return { name: 'realtime',   css: 'realtime' };
+      if (handle === '1:20')                       return { name: 'bulk',       css: 'bulk' };
+      if (handle === '1:30')                       return { name: 'background', css: 'background' };
+      if (handle === '1:1' || handle === '1:')     return { name: 'root',       css: '' };
+      return { name: handle || '?', css: '' };
+    }
+
+    // Parse '1500Kbit' / '200Mbit' / '0bit' etc. -> bps
+    function parseRate(s) {
+      if (s == null) return 0;
+      const m = String(s).match(/^([\d.]+)\s*([KMG]?)bit$/i);
+      if (!m) return Number(s) || 0;
+      const v = parseFloat(m[1]);
+      const u = m[2].toUpperCase();
+      return v * (u === 'K' ? 1e3 : u === 'M' ? 1e6 : u === 'G' ? 1e9 : 1);
+    }
+
+    function fmtBps(bps) {
+      if (!bps || bps < 1000) return (bps|0) + ' bps';
+      if (bps < 1e6) return (bps/1e3).toFixed(1) + ' Kbps';
+      if (bps < 1e9) return (bps/1e6).toFixed(1) + ' Mbps';
+      return (bps/1e9).toFixed(2) + ' Gbps';
+    }
+
+    async function poll() {
+      let d;
+      try {
+        const r = await fetch('/cgi-bin/ratan-api/qos-status', { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        d = await r.json();
+      } catch (e) {
+        document.getElementById('content').innerHTML =
+          `<div class="qos-empty">QoS endpoint unreachable<div class="hint">${e.message}</div></div>`;
+        return;
+      }
+      if (!d.wans || d.wans.length === 0) {
+        document.getElementById('content').innerHTML =
+          `<div class="qos-empty">No WANs configured for QoS.<div class="hint">
+           Edit <span class="mono">/etc/config/ratan-qos</span> and reload
+           <span class="mono">/etc/init.d/ratan-qos</span>.</div></div>`;
+        return;
+      }
+
+      const now = Date.now();
+      const html = d.wans.map(w => {
+        const classes = (w.classes || []).filter(c =>
+          c.handle && c.handle !== '1:' && c.handle !== '1:1'
+        );
+        if (classes.length === 0) {
+          return `<div class="card" style="margin-bottom:14px;">
+            <div class="card-head">
+              <div class="card-title">${w.label || w.iface}<span class="card-title-sub">${w.iface}</span></div>
+              <div class="badge cold">no qos</div>
+            </div>
+            <div class="qos-empty">
+              No tc HTB tree on this iface yet.
+              <div class="hint">Run <span class="mono">/etc/init.d/ratan-qos start</span> on the router.</div>
+            </div>
+          </div>`;
+        }
+
+        const rows = classes.map(cls => {
+          const meta = classMeta(cls.handle);
+          const stats = cls.stats || {};
+          const sent_bytes = stats.bytes || 0;
+          const drops = stats.drops || 0;
+          const overlimits = stats.overlimits || 0;
+          const floor_bps = parseRate(cls.rate);
+          const ceil_bps  = parseRate(cls.ceil);
+
+          // Compute current bps from delta vs previous poll.
+          const key = `${w.wan_id}|${cls.handle}`;
+          const prv = prev.get(key);
+          let cur_bps = 0;
+          if (prv && now - prv.ts_ms > 200) {
+            const dt_s = (now - prv.ts_ms) / 1000;
+            const db = Math.max(0, sent_bytes - prv.bytes);
+            cur_bps = (db * 8) / dt_s;
+          }
+          prev.set(key, { bytes: sent_bytes, ts_ms: now });
+
+          // Bar width = cur / ceil; floor notch position = floor / ceil.
+          const pct_cur   = ceil_bps > 0 ? Math.min(100, (cur_bps / ceil_bps) * 100) : 0;
+          const pct_floor = ceil_bps > 0 ? Math.min(100, (floor_bps / ceil_bps) * 100) : 0;
+
+          return `
+            <div class="qos-class">
+              <div class="qos-class-head">
+                <span class="name ${meta.css}">${meta.name}</span>
+                <span class="handle">${cls.handle} · prio ${cls.prio ?? '-'}</span>
+              </div>
+              <div class="qos-bar-stack">
+                <div class="qos-bar">
+                  <div class="qos-bar-fill ${meta.css}" style="width:${pct_cur.toFixed(1)}%"></div>
+                  <div class="qos-bar-floor-line" style="left:${pct_floor.toFixed(1)}%"
+                       title="floor ${fmtBps(floor_bps)}"></div>
+                </div>
+                <div class="qos-bar-meta">
+                  <span>current <span style="color:var(--fg);">${fmtBps(cur_bps)}</span></span>
+                  <span>floor ${fmtBps(floor_bps)} · ceil ${fmtBps(ceil_bps)}</span>
+                </div>
+              </div>
+              <div class="qos-stats">
+                <div>sent <span class="v">${fmt.bytes(sent_bytes)}</span></div>
+                <div class="drops ${drops > 0 ? 'bad' : ''}">drops <span class="v">${drops}</span></div>
+                <div>overlimits <span class="v">${overlimits}</span></div>
+              </div>
+            </div>`;
+        }).join('');
+
+        return `<div class="card" style="margin-bottom:14px;">
+          <div class="card-head">
+            <div>
+              <div class="card-title">${w.label || w.iface}<span class="card-title-sub">${w.iface}</span></div>
+              <div style="font-family:var(--mono); font-size:11px; color:var(--fg-2); margin-top:3px;">
+                tc htb · ${classes.length} classes
+              </div>
+            </div>
+            <div class="badge healthy">active</div>
+          </div>
+          ${rows}
+        </div>`;
+      }).join('');
+
+      document.getElementById('content').innerHTML = html;
+    }
+
+    poll();
+    let timer = setInterval(poll, 2000);
+    document.getElementById('live-toggle').addEventListener('change', e => {
+      if (e.target.checked) { poll(); timer = setInterval(poll, 2000); }
+      else { clearInterval(timer); timer = null; }
+    });
+  </script>
+</body>
+</html>

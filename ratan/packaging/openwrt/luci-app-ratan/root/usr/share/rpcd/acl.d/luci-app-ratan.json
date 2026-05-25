@@ -1,0 +1,12 @@
+{
+	"luci-app-ratan": {
+		"description": "Grant access to the RATAN dashboard",
+		"read": {
+			"file": {
+				"/www/cgi-bin/ratan-api": [ "exec" ],
+				"/www/ratan-data/handover-status.json": [ "read" ]
+			}
+		},
+		"write": {}
+	}
+}

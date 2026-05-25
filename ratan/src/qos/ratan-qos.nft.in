@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# RATAN QoS nftables ruleset -- classification by ct->mark.
+#
+# This file is the INPUT template; ratan-qos-apply.sh renders it
+# (no substitutions today, but reserved for future per-WAN tweaks
+# like per-iface chains) and loads it with `nft -f`.
+#
+# Contract:
+#   ct->mark = 1  -- realtime (VideoCall/*, VoIP/*) -> tc class 1:10
+#   ct->mark = 2  -- bulk     (Web/*, Streaming/*)  -> tc class 1:20
+#   ct->mark = 3  -- background                     -> tc class 1:30
+#   ct->mark = 0  -- unclassified (default class)   -> tc class 1:20 (bulk)
+#
+# Whoever marks the conntrack is OUTSIDE this file:
+#   - OMR's nDPI-netfilter writes the category id to ct->mark, OR
+#   - ratan-qos-marker (Step 8b) subscribes to telemetry flow events
+#     and writes ct->mark to match category against ratan-qos-classes.json
+#
+# We don't care which source did the marking; we just classify on it.
+
+table inet ratan_qos {
+    # Drop a stale instance of this table before reloading is the apply
+    # script's job (`nft delete table inet ratan_qos`); nothing to do here.
+
+    chain output {
+        type filter hook output priority -150; policy accept;
+        ct mark 1 meta priority set 1:10  comment "realtime"
+        ct mark 2 meta priority set 1:20  comment "bulk"
+        ct mark 3 meta priority set 1:30  comment "background"
+        # explicit default: anything unmarked goes to bulk
+        meta priority set 1:20
+    }
+
+    chain forward {
+        type filter hook forward priority -150; policy accept;
+        ct mark 1 meta priority set 1:10  comment "realtime"
+        ct mark 2 meta priority set 1:20  comment "bulk"
+        ct mark 3 meta priority set 1:30  comment "background"
+        meta priority set 1:20
+    }
+}

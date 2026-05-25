@@ -1,0 +1,67 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0
+#
+# procd init for ratan-telemetry.
+# Starts BEFORE ratan-prober (so the telemetry socket exists when the
+# prober's first sample lands).
+
+START=65       # before ratan-sched (70) and ratan-prober (80)
+STOP=15
+USE_PROCD=1
+
+PROG="/usr/sbin/ratan_telemetryd"
+
+start_service() {
+	local enabled db sock schema http_host http_port
+
+	config_load 'ratan-telemetry'
+	config_get_bool enabled main enabled 1
+	[ "$enabled" = "0" ] && {
+		logger -t ratan-telemetry "disabled in /etc/config/ratan-telemetry"
+		return 0
+	}
+
+	config_get db        main db        '/var/lib/ratan/telemetry.db'
+	config_get sock      main sock      '/run/ratan/telemetry.sock'
+	config_get schema    main schema    '/usr/share/ratan/schema.sql'
+	config_get http_host main http_host '127.0.0.1'
+	config_get http_port main http_port '9180'
+	config_get lease     main lease_file '/tmp/dhcp.leases'
+
+	procd_open_instance
+	procd_set_param command "$PROG" \
+		--db "$db" \
+		--schema "$schema" \
+		--sock "$sock" \
+		--http-host "$http_host" \
+		--http-port "$http_port" \
+		--lease-file "$lease" \
+		--foreground
+
+	# Mirror the prober's WAN config so /wan-stats can map subflow_idx -> iface
+	# for the per-WAN throughput chart on the dashboard.
+	add_wan() {
+		local sect="$1" iface idx
+		config_get iface "$sect" iface ''
+		config_get idx   "$sect" subflow_idx ''
+		[ -n "$iface" ] && [ -n "$idx" ] && \
+			procd_append_param command --wan "${idx}:${iface}:${sect}"
+	}
+	# Note: this depends on /etc/config/ratan-prober being readable.
+	config_load 'ratan-prober' 2>/dev/null && config_foreach add_wan wan
+	config_load 'ratan-telemetry'
+
+	procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-0}
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file /etc/config/ratan-telemetry
+	procd_close_instance
+}
+
+stop_service() {
+	:
+}
+
+service_triggers() {
+	procd_add_reload_trigger "ratan-telemetry"
+}

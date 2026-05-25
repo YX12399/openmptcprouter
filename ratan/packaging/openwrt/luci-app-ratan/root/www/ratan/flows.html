@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>RATAN · Flows</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="ratan.css" />
+  <style>
+    .filter-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--bg-1);
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--fg-2);
+    }
+    .filter-row input {
+      background: var(--surface);
+      border: 1px solid var(--line-2);
+      border-radius: var(--r-sm);
+      padding: 5px 9px;
+      color: var(--fg);
+      font-family: var(--mono);
+      font-size: 11px;
+      width: 240px;
+      outline: none;
+    }
+    .filter-row select {
+      background: var(--surface);
+      border: 1px solid var(--line-2);
+      border-radius: var(--r-sm);
+      padding: 5px 9px;
+      color: var(--fg);
+      font-family: var(--mono);
+      font-size: 11px;
+      outline: none;
+    }
+    tr.videocall td:first-child {
+      box-shadow: inset 2px 0 0 var(--healthy);
+    }
+    .traffic-bar {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+    .traffic-bar .seg {
+      height: 4px;
+      border-radius: 2px;
+      min-width: 4px;
+    }
+    .traffic-bar .seg.orig { background: var(--accent); }
+    .traffic-bar .seg.reply { background: #b78aff; }
+
+    .wan-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-family: var(--mono);
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 3px;
+      background: var(--surface-2);
+      border: 1px solid var(--line-2);
+      color: var(--fg-1);
+    }
+    .wan-tag::before { content: ''; width: 4px; height: 4px; border-radius: 50%; }
+    .wan-tag.w0::before { background: var(--accent); }
+    .wan-tag.w1::before { background: #b78aff; }
+
+    .summary-tiles {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .summary-tile {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--r);
+      padding: 14px 16px;
+    }
+    .summary-tile .lbl {
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--fg-2);
+      margin-bottom: 6px;
+    }
+    .summary-tile .v {
+      font-family: var(--mono);
+      font-size: 22px;
+      font-weight: 500;
+      color: var(--fg);
+      font-variant-numeric: tabular-nums;
+    }
+    .summary-tile .sub { font-family:var(--mono); font-size:10px; color: var(--fg-3); margin-top: 4px; }
+    @media (max-width: 768px) { .summary-tiles { grid-template-columns: 1fr 1fr; } }
+  </style>
+</head>
+<body>
+  <div id="nav-slot" data-screen-label="05 Flows"></div>
+
+  <main class="page">
+    <header class="page-head">
+      <div>
+        <div class="page-title">Flows</div>
+        <div class="page-sub">conntrack · ndpi category · mark-tagged for MPTCP policy</div>
+      </div>
+      <div class="page-head-actions">
+        <label class="switch">
+          <input type="checkbox" id="live-toggle" checked />
+          <span class="switch-track"></span>
+          <span>live</span>
+        </label>
+      </div>
+    </header>
+
+    <section class="summary-tiles">
+      <div class="summary-tile">
+        <div class="lbl">active flows</div>
+        <div class="v" id="t-total">0</div>
+        <div class="sub">in conntrack</div>
+      </div>
+      <div class="summary-tile" style="border-color: rgba(62,207,142,0.25);">
+        <div class="lbl" style="color: var(--healthy);">videocall flows</div>
+        <div class="v" id="t-video" style="color: var(--healthy);">0</div>
+        <div class="sub">protected · mark 42</div>
+      </div>
+      <div class="summary-tile">
+        <div class="lbl">throughput</div>
+        <div class="v" id="t-thr">— Mbps</div>
+        <div class="sub">aggregate · orig + reply</div>
+      </div>
+      <div class="summary-tile">
+        <div class="lbl">categories</div>
+        <div class="v" id="t-cat">0</div>
+        <div class="sub">distinct · ndpi</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="filter-row">
+        <span>filter</span>
+        <input id="search" placeholder="e.g. udp · :443 · VideoCall · 192.168.1.14" />
+        <span style="margin-left:8px;">category</span>
+        <select id="cat-filter">
+          <option value="">all</option>
+          <option value="VideoCall">VideoCall</option>
+          <option value="Web">Web</option>
+          <option value="Streaming">Streaming</option>
+          <option value="OS">OS</option>
+        </select>
+        <span style="margin-left:8px;">wan</span>
+        <select id="wan-filter">
+          <option value="">all</option>
+          <option value="0">wan_starlink</option>
+          <option value="1">wan_lte</option>
+        </select>
+        <span style="flex:1;"></span>
+        <span><span id="visible-n">0</span> / <span id="total-n">0</span> flows</span>
+      </div>
+
+      <table class="table compact">
+        <thead>
+          <tr>
+            <th style="width: 100px;">started</th>
+            <th>five-tuple</th>
+            <th style="width: 160px;">category</th>
+            <th class="mono" style="width: 70px;">mark</th>
+            <th style="width: 100px;">wan</th>
+            <th class="mono" style="width: 200px;">orig → reply</th>
+          </tr>
+        </thead>
+        <tbody id="flows-body"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="ratan.js"></script>
+  <script>
+    RATAN.mountNav('flows');
+    const { bus, STATE, fmt } = RATAN;
+
+    function tupleHTML(t) {
+      // e.g. udp:192.168.1.14:51820->52.114.7.8:443
+      const m = t.match(/^(\w+):([0-9\.]+):(\d+)[-→][->]?([0-9\.]+):(\d+)$/);
+      if (!m) return `<span class="tuple">${t}</span>`;
+      const [, proto, srcIP, srcPort, dstIP, dstPort] = m;
+      return `<span class="tuple">
+        <span class="proto">${proto}</span>
+        <span> </span>${srcIP}<span class="port">:${srcPort}</span>
+        <span class="arrow">→</span>${dstIP}<span class="port">:${dstPort}</span>
+      </span>`;
+    }
+
+    function catHTML(c) {
+      const isVideo = c.startsWith('VideoCall');
+      return `<span class="cat ${isVideo ? 'video' : ''}">${c}</span>`;
+    }
+
+    function trafficHTML(orig, reply) {
+      const tot = orig + reply || 1;
+      const ow = Math.max(4, Math.round((orig / tot) * 80));
+      const rw = Math.max(4, Math.round((reply / tot) * 80));
+      return `<span class="traffic-bar">
+        <span class="seg orig" style="width:${ow}px"></span>
+        <span style="color: var(--fg-1);">${fmt.bytes(orig)}</span>
+        <span style="color: var(--fg-3);">·</span>
+        <span class="seg reply" style="width:${rw}px"></span>
+        <span style="color: var(--fg-1);">${fmt.bytes(reply)}</span>
+      </span>`;
+    }
+
+    function passes(f) {
+      const q = document.getElementById('search').value.trim().toLowerCase();
+      if (q && !(`${f.five_tuple} ${f.category}`.toLowerCase().includes(q))) return false;
+      const cf = document.getElementById('cat-filter').value;
+      if (cf && !f.category.startsWith(cf)) return false;
+      const wf = document.getElementById('wan-filter').value;
+      if (wf !== '' && String(f.wan) !== wf) return false;
+      return true;
+    }
+
+    function render() {
+      const flows = STATE.flows.slice().sort((a,b) => b.ts - a.ts);
+      const visible = flows.filter(passes);
+      document.getElementById('flows-body').innerHTML = visible.map(f => `
+        <tr class="${f.category.startsWith('VideoCall') ? 'videocall' : ''}">
+          <td class="mono" style="color: var(--fg-3); font-size: 11px;">${fmt.ago(f.ts)}</td>
+          <td>${tupleHTML(f.five_tuple)}</td>
+          <td>${catHTML(f.category)}</td>
+          <td class="mono">${f.mark}</td>
+          <td><span class="wan-tag w${f.wan}">wan_${f.wan === 0 ? 'starlink' : 'lte'}</span></td>
+          <td>${trafficHTML(f.bytes_orig, f.bytes_reply)}</td>
+        </tr>
+      `).join('');
+
+      document.getElementById('visible-n').textContent = visible.length;
+      document.getElementById('total-n').textContent = flows.length;
+      document.getElementById('t-total').textContent = flows.length;
+      document.getElementById('t-video').textContent = flows.filter(f => f.category.startsWith('VideoCall')).length;
+      document.getElementById('t-cat').textContent = new Set(flows.map(f => f.category.split('/')[0])).size;
+      const totBps = STATE.wans.reduce((s,w) => s + w.bps * 8, 0);
+      document.getElementById('t-thr').textContent = (totBps / 1e6).toFixed(1) + ' Mbps';
+    }
+    render();
+
+    // accumulate traffic for active video call flows so they grow over time (demo)
+    let live = true;
+    document.getElementById('live-toggle').addEventListener('change', e => live = e.target.checked);
+    bus.on('tick', () => {
+      if (!live) return;
+      STATE.flows.forEach(f => {
+        // active = started recently or video
+        if (Date.now() - f.ts < 60_000 || f.category.startsWith('VideoCall')) {
+          f.bytes_orig += Math.round(40_000 + Math.random() * 80_000);
+          f.bytes_reply += Math.round(80_000 + Math.random() * 200_000);
+        }
+      });
+      render();
+    });
+
+    document.getElementById('search').addEventListener('input', render);
+    document.getElementById('cat-filter').addEventListener('change', render);
+    document.getElementById('wan-filter').addEventListener('change', render);
+
+    // STATE.flows is populated by the adapter's pollFlows() against the
+    // real /flows endpoint. We re-render whenever new flow events arrive on
+    // the bus so the table refreshes promptly, plus every few seconds so
+    // the "Nm ago" timestamps tick.
+    bus.on('flow', render);
+    bus.on('tick', () => {
+      if ((Date.now() / 1000 | 0) % 3 === 0) render();
+    });
+  </script>
+</body>
+</html>
